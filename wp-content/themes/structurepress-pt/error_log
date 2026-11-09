@@ -1,0 +1,64 @@
+[24-Jul-2024 17:26:57 UTC] PHP Fatal error:  Uncaught Error: Call to undefined function get_header() in /home/vartdeveloper/public_html/wp-content/themes/structurepress-pt/index.php:15
+Stack trace:
+#0 {main}
+  thrown in /home/vartdeveloper/public_html/wp-content/themes/structurepress-pt/index.php on line 15
+[08-Oct-2025 01:07:39 UTC] PHP Fatal error:  Uncaught Error: Call to undefined function get_header() in /home/vartdeveloper/public_html/wp-content/themes/structurepress-pt/index.php:15
+Stack trace:
+#0 {main}
+  thrown in /home/vartdeveloper/public_html/wp-content/themes/structurepress-pt/index.php on line 15
+[04-May-2026 08:53:53 UTC] PHP Fatal error:  Uncaught Error: Call to undefined function get_header() in /home/vartdeveloper/public_html/wp-content/themes/structurepress-pt/index.php:15
+Stack trace:
+#0 {main}
+  thrown in /home/vartdeveloper/public_html/wp-content/themes/structurepress-pt/index.php on line 15
+[04-May-2026 11:42:39 UTC] PHP Fatal error:  Uncaught Error: Call to undefined function get_header() in /home/vartdeveloper/public_html/wp-content/themes/structurepress-pt/index.php:15
+Stack trace:
+#0 {main}
+  thrown in /home/vartdeveloper/public_html/wp-content/themes/structurepress-pt/index.php on line 15
+[04-May-2026 21:43:22 UTC] PHP Fatal error:  Uncaught Error: Call to undefined function get_header() in /home/vartdeveloper/public_html/wp-content/themes/structurepress-pt/index.php:15
+Stack trace:
+#0 {main}
+  thrown in /home/vartdeveloper/public_html/wp-content/themes/structurepress-pt/index.php on line 15
+[04-May-2026 22:02:09 UTC] PHP Fatal error:  Uncaught Error: Call to undefined function get_header() in /home/vartdeveloper/public_html/wp-content/themes/structurepress-pt/index.php:15
+Stack trace:
+#0 {main}
+  thrown in /home/vartdeveloper/public_html/wp-content/themes/structurepress-pt/index.php on line 15
+[04-May-2026 22:02:11 UTC] PHP Fatal error:  Uncaught Error: Call to undefined function get_header() in /home/vartdeveloper/public_html/wp-content/themes/structurepress-pt/index.php:15
+Stack trace:
+#0 {main}
+  thrown in /home/vartdeveloper/public_html/wp-content/themes/structurepress-pt/index.php on line 15
+[05-May-2026 11:38:30 UTC] PHP Fatal error:  Uncaught Error: Call to undefined function get_header() in /home/vartdeveloper/public_html/wp-content/themes/structurepress-pt/index.php:15
+Stack trace:
+#0 {main}
+  thrown in /home/vartdeveloper/public_html/wp-content/themes/structurepress-pt/index.php on line 15
+[06-May-2026 11:35:59 UTC] PHP Fatal error:  Uncaught Error: Call to undefined function get_header() in /home/vartdeveloper/public_html/wp-content/themes/structurepress-pt/index.php:15
+Stack trace:
+#0 {main}
+  thrown in /home/vartdeveloper/public_html/wp-content/themes/structurepress-pt/index.php on line 15
+[07-May-2026 00:37:57 UTC] PHP Fatal error:  Uncaught Error: Call to undefined function get_header() in /home/vartdeveloper/public_html/wp-content/themes/structurepress-pt/index.php:15
+Stack trace:
+#0 {main}
+  thrown in /home/vartdeveloper/public_html/wp-content/themes/structurepress-pt/index.php on line 15
+[07-May-2026 11:46:38 UTC] PHP Fatal error:  Uncaught Error: Call to undefined function get_header() in /home/vartdeveloper/public_html/wp-content/themes/structurepress-pt/index.php:15
+Stack trace:
+#0 {main}
+  thrown in /home/vartdeveloper/public_html/wp-content/themes/structurepress-pt/index.php on line 15
+[08-May-2026 11:55:47 UTC] PHP Fatal error:  Uncaught Error: Call to undefined function get_header() in /home/vartdeveloper/public_html/wp-content/themes/structurepress-pt/index.php:15
+Stack trace:
+#0 {main}
+  thrown in /home/vartdeveloper/public_html/wp-content/themes/structurepress-pt/index.php on line 15
+[09-May-2026 11:35:21 UTC] PHP Fatal error:  Uncaught Error: Call to undefined function get_header() in /home/vartdeveloper/public_html/wp-content/themes/structurepress-pt/index.php:15
+Stack trace:
+#0 {main}
+  thrown in /home/vartdeveloper/public_html/wp-content/themes/structurepress-pt/index.php on line 15
+[10-May-2026 11:29:03 UTC] PHP Fatal error:  Uncaught Error: Call to undefined function get_header() in /home/vartdeveloper/public_html/wp-content/themes/structurepress-pt/index.php:15
+Stack trace:
+#0 {main}
+  thrown in /home/vartdeveloper/public_html/wp-content/themes/structurepress-pt/index.php on line 15
+[10-May-2026 21:47:57 UTC] PHP Fatal error:  Uncaught Error: Call to undefined function get_header() in /home/vartdeveloper/public_html/wp-content/themes/structurepress-pt/index.php:15
+Stack trace:
+#0 {main}
+  thrown in /home/vartdeveloper/public_html/wp-content/themes/structurepress-pt/index.php on line 15
+[11-May-2026 11:37:42 UTC] PHP Fatal error:  Uncaught Error: Call to undefined function get_header() in /home/vartdeveloper/public_html/wp-content/themes/structurepress-pt/index.php:15
+Stack trace:
+#0 {main}
+  thrown in /home/vartdeveloper/public_html/wp-content/themes/structurepress-pt/index.php on line 15

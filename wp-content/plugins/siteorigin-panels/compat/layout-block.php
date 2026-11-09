@@ -1,0 +1,1210 @@
+<?php
+
+class SiteOrigin_Panels_Compat_Layout_Block {
+	const BLOCK_NAME = 'siteorigin-panels/layout-block';
+	private $return_layout = true;
+
+	/**
+	 * Request-local set of hashes of panelsData already sanitized this request,
+	 * so the two save hooks that both fire on a single REST save (the
+	 * rest_pre_insert_* server_side_validation() and the wp_insert_post_data
+	 * validate_post_data() safety net) do not each run every widget's update()
+	 * a second time. Purely in-memory: no postmeta, option, transient, marker,
+	 * signature or salt. A hash MISS (JSON encoding differing across the
+	 * serialize_blocks -> wp_slash -> wp_unslash -> parse_blocks round trip)
+	 * just sanitizes twice, which is safe; a false HIT would require a sha256
+	 * collision. Do NOT canonicalize to force matches — that is the complexity
+	 * the trust-signature removal deliberately shed.
+	 *
+	 * @var array<string,true>
+	 */
+	private $sanitized_this_request = array();
+
+	/**
+	 * When true, the save-time kses floor in render_layout_block() is applied
+	 * regardless of the author's `unfiltered_html` capability. Set/restored
+	 * only by sanitize_block_untrusted() around the chokepoint call (the same
+	 * instance-scoped discipline as $return_layout): origin-untrusted content
+	 * (AI ability writes) must never be stored unfloored, because the
+	 * capability belongs to the request's author while the content's origin
+	 * does not. Deliberately private state, not a filter — third-party code
+	 * must not be able to toggle a security floor.
+	 */
+	private $force_kses_floor = false;
+
+	/**
+	 * Pre-write context for one layout-update ability write: null, or
+	 * array( 'post_id' => int, 'block_index' => int ).
+	 *
+	 * Set only by sanitize_block_for_layout_update(), and taken (read and
+	 * cleared) once by the save branch of render_layout_block(), which then
+	 * fires the `siteorigin_panels_layout_update_pre_write` hook. Private so no
+	 * third-party code can set or clear it.
+	 *
+	 * @var array|null
+	 */
+	private $layout_update_pre_write = null;
+
+	/**
+	 * Get the singleton instance
+	 *
+	 * @return SiteOrigin_Panels_Compat_Layout_Block
+	 */
+	public static function single() {
+		static $single;
+
+		return empty( $single ) ? $single = new self() : $single;
+	}
+
+	public function __construct() {
+		add_action( 'init', array( $this, 'register_layout_block' ) );
+		// This action is slightly later than `enqueue_block_editor_assets`,
+		// which we need to use to ensure our templates are loaded at the right time.
+		add_action( 'admin_enqueue_scripts', array( $this, 'enqueue_layout_block_editor_assets' ) );
+
+		// We need to override the container when using the Block Editor to allow for resizing.
+		add_filter( 'siteorigin_panels_full_width_container', array( $this, 'override_container' ) );
+
+		add_action( 'wp_head', array( $this, 'maybe_generate_layout_block_css' ) );
+
+		$post_types = siteorigin_panels_setting( 'post-types' );
+		if ( empty( $post_types ) ) {
+			$post_types = array( 'post', 'page' );
+		}
+		foreach ( $post_types as $post_type ) {
+			add_action( 'rest_pre_insert_' . $post_type, array( $this, 'server_side_validation' ), 10, 2 );
+		}
+
+		// Reusable blocks (wp_block posts) are never controlled by the
+		// 'post-types' setting above — that setting toggles which post types
+		// SHOW the Layout Block in their editor, not which saved content
+		// requires validation. A Layout Block embedded in a reusable block can
+		// end up rendered inside ANY post type via block-reuse, so wp_block
+		// saves must always be validated regardless of site configuration.
+		// wp_block is a REST-enabled ('show_in_rest' => true) built-in post
+		// type using WP_REST_Blocks_Controller (extends WP_REST_Posts_Controller
+		// without overriding prepare_item_for_database()), so
+		// rest_pre_insert_wp_block fires through the identical mechanism as
+		// rest_pre_insert_post/rest_pre_insert_page.
+		add_action( 'rest_pre_insert_wp_block', array( $this, 'server_side_validation' ), 10, 2 );
+
+		// Block-based widget areas store Block-widget content (including any
+		// embedded Layout Block) in the widget_block OPTION, written via
+		// WP_Widget::save_settings() -> update_option( 'widget_block', ... ) —
+		// never through wp_insert_post()/rest_pre_insert_*. Every write path
+		// (classic widgets.php, Customizer, REST widgets controller) funnels
+		// through that same update_option() call, so the option-specific
+		// pre_update_option_widget_block filter is the single hook needed to
+		// sanitize Layout Blocks on this surface. Sanitizing here applies the
+		// save-time kses floor for admins lacking unfiltered_html (e.g.
+		// multisite).
+		add_filter( 'pre_update_option_widget_block', array( $this, 'validate_widget_block_option' ), 10, 1 );
+
+		// Supplemental (NOT a replacement for the rest_pre_insert_* hooks
+		// above): wp_insert_post_data fires for every wp_insert_post()/
+		// wp_update_post() caller EXCEPT attachments (post.php branches
+		// attachment saves to wp_insert_attachment_data instead; core kses
+		// still floors those) — XML-RPC, importers, WP-CLI, cron, direct
+		// calls — none of which pass through the REST hooks. On REST-driven
+		// saves both hooks still co-fire, but sanitize_block()'s same-request
+		// memo means a given block's widget update() runs once per request: the
+		// first hook records the sanitized output's hash and the second hook
+		// hits the memo and skips re-sanitizing. The exception is an
+		// origin-untrusted write (sanitize_block_untrusted() sets
+		// force_kses_floor), which always sanitizes regardless of the memo so
+		// the forced floor can never be skipped.
+		add_filter( 'wp_insert_post_data', array( $this, 'validate_post_data' ), 10, 1 );
+	}
+
+	public function register_layout_block() {
+		register_block_type( self::BLOCK_NAME, array(
+			'render_callback' => array( $this, 'render_layout_block' ),
+		) );
+	}
+
+	public function enqueue_layout_block_editor_assets() {
+		$is_block_editor = SiteOrigin_Panels_Admin::is_block_editor();
+
+		if ( $is_block_editor || is_customize_preview() ) {
+			if ( $is_block_editor && function_exists( 'aioseo' ) ) {
+				$aioseo = aioseo();
+				if (
+					is_object( $aioseo ) &&
+					isset( $aioseo->standalone ) &&
+					is_object( $aioseo->standalone ) &&
+					isset( $aioseo->standalone->pageBuilderIntegrations ) &&
+					is_array( $aioseo->standalone->pageBuilderIntegrations ) &&
+					isset( $aioseo->standalone->pageBuilderIntegrations['siteorigin'] ) &&
+					is_object( $aioseo->standalone->pageBuilderIntegrations['siteorigin'] )
+				) {
+					remove_action(
+						'siteorigin_panel_enqueue_admin_scripts',
+						array( $aioseo->standalone->pageBuilderIntegrations['siteorigin'], 'enqueue' )
+					);
+				}
+			}
+			$panels_admin = SiteOrigin_Panels_Admin::single();
+			$panels_admin->enqueue_admin_scripts();
+			$panels_admin->enqueue_admin_styles();
+
+			if ( ! is_customize_preview() ) {
+				$panels_admin->js_templates();
+			}
+
+			$current_screen = get_current_screen();
+			wp_enqueue_script(
+				'siteorigin-panels-layout-block',
+				plugins_url( 'js/siteorigin-panels-layout-block' . SITEORIGIN_PANELS_JS_SUFFIX . '.js', __FILE__ ),
+				array(
+					// The WP 5.8 Widget Area requires a specific editor script to be used.
+					$current_screen->base == 'widgets' ? 'wp-edit-widgets' : 'wp-editor',
+					'wp-blocks',
+					'wp-i18n',
+					'wp-element',
+					'wp-block-editor',
+					'wp-components',
+					'wp-compose',
+					'wp-data',
+					'so-panels-admin',
+				),
+				SITEORIGIN_PANELS_VERSION
+			);
+
+			$is_panels_post_type = in_array( $current_screen->id, siteorigin_panels_setting( 'post-types' ) );
+			wp_localize_script(
+				'siteorigin-panels-layout-block',
+				'soPanelsBlockEditorAdmin',
+				array(
+					'sanitizeUrl' => wp_nonce_url( admin_url( 'admin-ajax.php' ), 'layout-block-sanitize', '_panelsnonce' ),
+					'previewUrl' => wp_nonce_url( admin_url( 'admin-ajax.php' ), 'layout-block-preview', '_panelsnonce' ),
+					'postId' => get_the_ID(),
+					'liveEditor' => SiteOrigin_Panels::preview_url(),
+					'defaultMode' => siteorigin_panels_setting( 'layout-block-default-mode' ),
+					'showAddButton' => apply_filters(
+						'siteorigin_layout_block_show_add_button',
+						$is_panels_post_type && siteorigin_panels_setting( 'layout-block-quick-add' )
+					),
+				)
+			);
+			// This is only available in WP5.
+			if ( function_exists( 'wp_set_script_translations' ) ) {
+				wp_set_script_translations( 'siteorigin-panels-layout-block', 'siteorigin-panels' );
+			}
+			SiteOrigin_Panels_Styles::register_scripts();
+			wp_enqueue_script( 'siteorigin-panels-front-styles' );
+
+			// Enqueue front end scripts for our widgets bundle.
+			if ( class_exists( 'SiteOrigin_Widgets_Bundle' ) ) {
+				$sowb = SiteOrigin_Widgets_Bundle::single();
+				$sowb->register_general_scripts();
+
+				if ( method_exists( $sowb, 'enqueue_registered_widgets_scripts' ) ) {
+					$sowb->enqueue_registered_widgets_scripts( true, false );
+				}
+			}
+		}
+	}
+
+	public function render_layout_block( $attributes, $content = null ) {
+		if ( empty( $attributes['panelsData'] ) || ! is_array( $attributes['panelsData'] ) ) {
+			return '<div>' .
+			__( "You need to add a widget, row, or prebuilt layout before you'll see anything here. :)", 'siteorigin-panels' ) .
+			'</div>';
+		}
+		$panels_data = $attributes['panelsData'];
+		if ( $this->return_layout ) {
+			// Normal render (front-end or editor preview): unconditionally
+			// structural. Skips BOTH process_raw_widgets()'s update() calls AND
+			// sanitize_all() — never re-execute sanitizers against their own
+			// stored output; this codebase has repeatedly found that unsafe
+			// (see so-widgets-bundle PR #2316: posts field wiped to array(),
+			// multiple-media PHP 8 TypeError, select/icon/font fields reset
+			// valid values to default — all from re-running sanitizers against
+			// already-sanitized stored data). Markup protection happens at
+			// save time (core kses on HTTP paths, the kses floor below on
+			// unarmed paths), never at render.
+			$panels_data = $this->prepare_render_panels_data( $panels_data );
+		} else {
+			// Take the layout-update pre-write context once. Clearing it here
+			// means a nested save started from inside this one (an AI pre-save
+			// filter consumer, or a widget update()) does not fire the hook.
+			$layout_update_pre_write = $this->layout_update_pre_write;
+			$this->layout_update_pre_write = null;
+
+			/**
+			 * Filter a single Layout Block's panels_data before it is sanitized,
+			 * allowing an AI-generated layout to be supplied or transformed.
+			 *
+			 * Block-editor counterpart of the classic-editor
+			 * `siteorigin_panels_ai_layout_pre_save` filter (see inc/admin.php).
+			 * Public API — premium-addon-facing. Fires PER LAYOUT BLOCK (a post may
+			 * contain several), carrying only that block's panels_data.
+			 *
+			 * SAVE-TIME ONLY: this fires once per block on every save surface that
+			 * reaches the sanitize chokepoint — REST save validation
+			 * (`rest_pre_insert_*` → server_side_validation()), block widget areas
+			 * (`pre_update_option_widget_block` → validate_widget_block_option()),
+			 * the `wp_insert_post_data` safety net (validate_post_data()), and AI
+			 * ability block writes (sanitize_block_untrusted()). It never fires at
+			 * render: render is structural-only and deliberately does not re-fire
+			 * save-time transforms.
+			 *
+			 * Whatever a consumer returns is re-sanitized through
+			 * sanitize_panels_data() below, so returned widgets are NEVER trusted
+			 * raw. A layout CHANGED by this filter is additionally passed through
+			 * the kses floor regardless of the author's `unfiltered_html`
+			 * capability — AI-transformed output is prompt-injectable no matter
+			 * whose credential carries the request. Non-array returns are ignored.
+			 *
+			 * @since 2.38.0
+			 * @api
+			 *
+			 * @param array $panels_data The Layout Block's panels_data (grids, grid_cells, widgets).
+			 */
+			$filtered_panels_data = apply_filters( 'siteorigin_panels_ai_block_layout_pre_save', $panels_data );
+			if ( $layout_update_pre_write !== null && is_array( $filtered_panels_data ) ) {
+				SiteOrigin_Panels_Layout_Update_Unchanged::assert_walkable( $filtered_panels_data );
+				SiteOrigin_Panels_Layout_Update_Pre_Write::assert_supported_values( $filtered_panels_data );
+			}
+			$ai_changed_layout = is_array( $filtered_panels_data ) && $filtered_panels_data !== $panels_data;
+			if ( $ai_changed_layout ) {
+				$panels_data = $filtered_panels_data;
+			}
+
+			// Layout-update ability write: widgets the caller sent back
+			// unchanged keep their stored value; they skip update() and the
+			// floor. Only when the layout is still the caller's: a layout the
+			// AI pre-save filter replaced is floored whole.
+			$restored  = array();
+			$snapshots = array();
+			$kept      = array();
+			if (
+				$layout_update_pre_write !== null &&
+				! $ai_changed_layout &&
+				! empty( $layout_update_pre_write['stored']['widgets'] ) &&
+				is_array( $layout_update_pre_write['stored']['widgets'] ) &&
+				! empty( $panels_data['widgets'] ) &&
+				is_array( $panels_data['widgets'] )
+			) {
+				$incoming = array();
+				foreach ( $panels_data['widgets'] as $key => $widget ) {
+					if ( SiteOrigin_Panels_Layout_Update_Unchanged::comparable( $widget ) ) {
+						$incoming[ $key ] = $widget;
+					}
+				}
+				$baseline = array();
+				foreach ( $layout_update_pre_write['stored']['widgets'] as $key => $widget ) {
+					if ( SiteOrigin_Panels_Layout_Update_Unchanged::comparable( $widget ) ) {
+						$baseline[ $key ] = $widget;
+					}
+				}
+
+				$matches  = SiteOrigin_Panels_Layout_Update_Unchanged::match( $incoming, $baseline, $layout_update_pre_write['object_keys'] );
+				$restored = SiteOrigin_Panels_Layout_Update_Unchanged::restore( $incoming, $baseline, $matches );
+				foreach ( $restored as $key => $widget ) {
+					$snapshots[ $key ] = SiteOrigin_Panels_Layout_Update_Pre_Write::detach( $widget );
+				}
+			}
+
+			// Save-time validation (sanitize_block()): strict, capability-gated
+			// sanitize.
+			$panels_data = $this->sanitize_panels_data( $panels_data, $restored );
+
+			// current_user_can() runs in the real save-time request context
+			// (the author's session), which is the only place capability-gated
+			// sanitization is meaningful. Origin-untrusted content is floored
+			// unconditionally: the capability belongs to the request's author,
+			// but the content's origin is the AI (a forced-floor write via
+			// sanitize_block_untrusted(), or a layout the AI pre-save filter
+			// changed).
+			if ( $this->force_kses_floor || $ai_changed_layout || ! current_user_can( 'unfiltered_html' ) ) {
+				// Floor: stored output must not depend on any individual
+				// field/widget sanitizer being "healthy" this request (some
+				// SiteOrigin Widgets Bundle field sanitizers can silently pass
+				// through unvalidated when their options registry isn't
+				// hydrated on a given request — see so-widgets-bundle PR
+				// #2316). wp_kses_post() needs no hydrated registry and is
+				// idempotent, so it's a safe universal floor independent of
+				// that failure mode.
+				if ( $layout_update_pre_write !== null ) {
+					// A layout-update write floors every widget except one that
+					// still equals the stored widget it was matched to.
+					SiteOrigin_Panels_Layout_Update_Unchanged::assert_walkable( $panels_data );
+					$panels_data['widgets'] = SiteOrigin_Panels_Layout_Update_Unchanged::floor( $panels_data['widgets'], $snapshots, array(), $kept );
+				} else {
+					$panels_data['widgets'] = SiteOrigin_Panels_Admin::kses_deep( $panels_data['widgets'] );
+				}
+			}
+
+			// Layout-update ability write: settle the layout into the form the
+			// post update will store, check that the builder can load that
+			// form, then let an add-on stop the write. All three run before
+			// the render below, and the render, the returned panelsData and
+			// the same-request memo all use this final form.
+			if ( $layout_update_pre_write !== null ) {
+				$kept_widgets = array();
+				foreach ( $kept as $key ) {
+					$kept_widgets[ $key ] = $panels_data['widgets'][ $key ];
+				}
+
+				$panels_data = $this->final_stored_panels_data( $panels_data );
+
+				// For a user without unfiltered_html, WordPress kses runs over
+				// the post content. A kept widget it would change or strip
+				// (an existing embed, for example) stops the write: storing
+				// the layout would lose content the caller did not change.
+				if ( ! empty( $kept_widgets ) && ! current_user_can( 'unfiltered_html' ) ) {
+					$this->assert_kept_widgets_stored( $kept_widgets, $panels_data );
+				}
+
+				// The same structural rule an editor save of a classic layout
+				// applies. Only a layout-update write reaches this; an editor
+				// save of a Layout Block is stored as before.
+				if ( SiteOrigin_Panels_Admin::validate_layout_structure( $panels_data ) === null ) {
+					throw new SiteOrigin_Panels_Layout_Update_Aborted(
+						new WP_Error(
+							'siteorigin_panels_layout_update_unresolved_reference',
+							__( 'The layout was not saved because the builder cannot load it. A layout needs grids and grid_cells lists. Each grid_cells entry needs a numeric grid that points at an existing row. Each widget needs a numeric panels_info.grid and panels_info.cell that point at an existing row and cell. The layout-get ability returns layouts in this shape.', 'siteorigin-panels' )
+						)
+					);
+				}
+
+				$panels_data = SiteOrigin_Panels_Layout_Update_Pre_Write::detach( $panels_data );
+				SiteOrigin_Panels_Layout_Update_Pre_Write::run( $panels_data, $layout_update_pre_write['post_id'], 'block', $layout_update_pre_write['block_index'] );
+			}
+		}
+		$builder_id = isset( $attributes['builder_id'] ) ? $attributes['builder_id'] : uniqid( 'gb' . get_the_ID() . '-' );
+
+		// Support for custom CSS classes
+		$add_custom_class_name = function ( $class_names ) use ( $attributes ) {
+			if ( ! empty( $attributes['className'] ) ) {
+				$class_names[] = $attributes['className'];
+			}
+
+			return $class_names;
+		};
+
+		$is_editing = SiteOrigin_Panels_Admin::is_block_editor();
+
+		add_filter( 'siteorigin_panels_layout_classes', $add_custom_class_name );
+
+		if ( $is_editing ) {
+			SiteOrigin_Panels_Post_Content_Filters::add_filters( true );
+		}
+
+		if ( $is_editing || ! $this->return_layout ) {
+			$rendered_layout = SiteOrigin_Panels_Admin::render_and_restore_post_globals( $builder_id, ! $is_editing, $panels_data );
+		} else {
+			$rendered_layout = SiteOrigin_Panels::renderer()->render( $builder_id, true, $panels_data );
+		}
+
+		if ( $is_editing ) {
+			SiteOrigin_Panels_Post_Content_Filters::remove_filters( true );
+		}
+
+		remove_filter( 'siteorigin_panels_layout_classes', $add_custom_class_name );
+
+		if ( is_wp_error( $rendered_layout ) ) {
+			return $rendered_layout;
+		}
+
+		if ( $is_editing ) {
+			$rendered_layout .= SiteOrigin_Panels_Renderer::single()->print_inline_css( true );
+		}
+
+		$rendered_layout = $this->remove_block_comments( $rendered_layout );
+		if ( $this->return_layout ) {
+			return $is_editing ? wp_json_encode( $rendered_layout ) : $rendered_layout;
+		}
+
+		$attributes['panelsData'] = $panels_data;
+		$attributes['contentPreview'] = wp_json_encode( $rendered_layout );
+
+		return $attributes;
+	}
+
+	/**
+	 * The panelsData a layout-update block write will store.
+	 *
+	 * The post update that follows the save branch runs WordPress's save
+	 * filters over the post content (for a user without `unfiltered_html`
+	 * this includes core kses over every block attribute) and then
+	 * validate_post_data(), which undoes core's `&amp;` artifact. Running the
+	 * same transforms here until the layout stops changing gives the form
+	 * that is stored, so the pre-write hook payload equals the stored layout
+	 * and the later save finds nothing left to change. For a user without
+	 * `unfiltered_html`, the result is then checked against the widgets the
+	 * floor kept (assert_kept_widgets_stored()).
+	 *
+	 * At most 8 passes: this is a fail-closed limit, not a claim that the
+	 * filters always settle. A layout that has not settled by then, or a pass
+	 * that yields no usable layout, stops the write. For a user without
+	 * `unfiltered_html`, each pass removes one `amp;` level from tag-free
+	 * text, and core kses may then pad a numeric entity once, so text with N
+	 * `amp;` levels settles by pass N + 2 (`&amp;#91;` on pass 3,
+	 * `&amp;amp;#91;` on pass 4). 8 passes accept up to six levels, well past
+	 * any escaping an author writes by hand, and cap the cost at eight
+	 * filter passes over one block.
+	 *
+	 * @param array $panels_data Sanitized, floored panelsData.
+	 *
+	 * @throws SiteOrigin_Panels_Layout_Update_Aborted Code siteorigin_panels_layout_update_unstable.
+	 *
+	 * @return array
+	 */
+	private function final_stored_panels_data( $panels_data ) {
+		for ( $pass = 0; $pass < 8; $pass++ ) {
+			$next = $this->simulate_post_save( $panels_data );
+
+			if ( ! is_array( $next ) ) {
+				break;
+			}
+
+			if ( $next === $panels_data ) {
+				return $next;
+			}
+
+			$panels_data = $next;
+		}
+
+		throw new SiteOrigin_Panels_Layout_Update_Aborted(
+			new WP_Error(
+				'siteorigin_panels_layout_update_unstable',
+				__( 'The layout could not be prepared for saving.', 'siteorigin-panels' )
+			)
+		);
+	}
+
+	/**
+	 * Stop a layout-update write that would change a kept widget.
+	 *
+	 * Block storage is JSON, so a kept widget is stored unchanged when the
+	 * settled panelsData holds its JSON form at the same key.
+	 *
+	 * @param array $kept_widgets Key => widget the floor kept.
+	 * @param array $panels_data  The settled panelsData from final_stored_panels_data().
+	 *
+	 * @throws SiteOrigin_Panels_Layout_Update_Aborted Code siteorigin_panels_layout_update_needs_unfiltered_html.
+	 */
+	private function assert_kept_widgets_stored( $kept_widgets, $panels_data ) {
+		foreach ( $kept_widgets as $key => $widget ) {
+			if (
+				! isset( $panels_data['widgets'][ $key ] ) ||
+				! SiteOrigin_Panels_Layout_Update_Unchanged::same( json_decode( wp_json_encode( $widget ), true ), $panels_data['widgets'][ $key ] )
+			) {
+				throw new SiteOrigin_Panels_Layout_Update_Aborted(
+					new WP_Error(
+						'siteorigin_panels_layout_update_needs_unfiltered_html',
+						is_multisite()
+							? __( "The layout wasn't saved because it has an embed or HTML your account can't save. Ask a Super Admin for the multisite network to make the change.", 'siteorigin-panels' )
+							: __( "The layout wasn't saved because it has an embed or HTML your account can't save. Ask a user who can save HTML on this site to make the change.", 'siteorigin-panels' ),
+						array( 'status' => 403 )
+					)
+				);
+			}
+		}
+	}
+
+	/**
+	 * One pass of what the post update does to this block's panelsData.
+	 *
+	 * Serializes the block alone, applies the two filters sanitize_post()
+	 * applies to `post_content` in the 'db' context (`pre_post_content` and
+	 * `content_save_pre`), parses it back, then applies the same `&amp;`
+	 * repair validate_post_data() applies, under the same condition. The
+	 * serialize and parse round trip also turns any object into an array, as
+	 * storage does.
+	 *
+	 * @param array $panels_data panelsData to pass through the save filters.
+	 *
+	 * @return array|null The resulting panelsData, or null if the block did not survive.
+	 */
+	private function simulate_post_save( $panels_data ) {
+		$content = wp_slash(
+			serialize_block(
+				array(
+					'blockName'    => self::BLOCK_NAME,
+					'attrs'        => array( 'panelsData' => $panels_data ),
+					'innerBlocks'  => array(),
+					'innerHTML'    => '',
+					'innerContent' => array(),
+				)
+			)
+		);
+
+		$content = apply_filters( 'pre_post_content', $content );
+		$content = apply_filters( 'content_save_pre', $content );
+
+		$result = null;
+		foreach ( parse_blocks( wp_unslash( $content ) ) as $block ) {
+			if ( ! empty( $block['blockName'] ) && $block['blockName'] === self::BLOCK_NAME ) {
+				if ( isset( $block['attrs']['panelsData'] ) && is_array( $block['attrs']['panelsData'] ) ) {
+					$result = $block['attrs']['panelsData'];
+				}
+				break;
+			}
+		}
+
+		if ( $result !== null && ! current_user_can( 'unfiltered_html' ) ) {
+			$result = $this->repair_core_kses_ampersands( $result );
+		}
+
+		return $result;
+	}
+
+	// Remove Blocks to prevent potential issues.
+	private function remove_block_comments( $content ) {
+		return preg_replace( '/<!-- \/?(wp:.*?)-->/s', '', $content );
+	}
+
+	/**
+	 * Sanitize a Layout Block layout for storage.
+	 *
+	 * @param array $panels_data The layout.
+	 * @param array $restored    Key => widget kept from storage. These skip
+	 *                           process_raw_widgets(); every other widget is
+	 *                           processed and written back at its own key.
+	 */
+	private function sanitize_panels_data( $panels_data, $restored = array() ) {
+		if ( ! is_array( $panels_data ) ) {
+			return $panels_data;
+		}
+		// Strip any inbound 'sanitize_signature' key (legacy trust marker from
+		// the removed signing scheme) so stale or client-forged keys age out on
+		// re-save and never persist into stored panels_data.
+		unset( $panels_data['sanitize_signature'] );
+
+		if ( ! empty( $restored ) && is_array( $panels_data['widgets'] ) ) {
+			$processed = SiteOrigin_Panels_Admin::single()->process_raw_widgets( array_diff_key( $panels_data['widgets'], $restored ), false, true );
+			foreach ( $processed as $key => $widget ) {
+				$panels_data['widgets'][ $key ] = $widget;
+			}
+			foreach ( $restored as $key => $widget ) {
+				$panels_data['widgets'][ $key ] = $widget;
+			}
+		} else {
+			$panels_data['widgets'] = SiteOrigin_Panels_Admin::single()->process_raw_widgets( $panels_data['widgets'], false, true );
+		}
+		$panels_data = SiteOrigin_Panels_Styles_Admin::single()->sanitize_all( $panels_data );
+
+		return $panels_data;
+	}
+
+	/**
+	 * Prepare panels_data for rendering — unconditionally structural.
+	 *
+	 * Structural processing only (class resolution, panels_info assembly,
+	 * raw-flag strip) — do NOT call update() or sanitize_all() here; never
+	 * re-execute sanitizers against their own stored output (see
+	 * so-widgets-bundle PR #2316). process_raw_widgets()'s $structural_only
+	 * param skips the update()/kses_deep sanitize branches while keeping class
+	 * resolution, escape_classes, and raw-flag unset intact. Render never
+	 * consults a trust marker: save-time markup protection lives at the save
+	 * chokepoints (core kses on HTTP paths, the kses floor on unarmed paths).
+	 *
+	 * Kept as the single shared prep point for render (render_layout_block())
+	 * and CSS (maybe_generate_layout_block_css()) so the two never disagree
+	 * about structure.
+	 *
+	 * @param array $panels_data Panels data from the stored block attribute.
+	 * @return array
+	 */
+	private function prepare_render_panels_data( $panels_data ) {
+		$panels_data = $this->normalize_render_fields( $panels_data );
+		$panels_data['widgets'] = SiteOrigin_Panels_Admin::single()
+			->process_raw_widgets( $panels_data['widgets'], false, true, false, true );
+
+		return $panels_data; // sanitize_all() deliberately NOT called here
+	}
+
+	/**
+	 * Recursively normalize volatile per-save fields so nothing downstream
+	 * chokes on a malformed value: 'builder_id' is kept only when it matches
+	 * [A-Za-z0-9_-]+ (regenerated otherwise); '_sow_form_timestamp' is cast
+	 * to int.
+	 *
+	 * @param array $panels_data Panels data (or any nested array of it).
+	 * @return array
+	 */
+	private function normalize_render_fields( $panels_data ) {
+		if ( ! is_array( $panels_data ) ) {
+			return $panels_data;
+		}
+
+		foreach ( $panels_data as $key => $value ) {
+			if ( $key === 'builder_id' ) {
+				if ( ! is_string( $value ) || ! preg_match( '/^[A-Za-z0-9_-]+$/', $value ) ) {
+					$panels_data[ $key ] = uniqid( 'gb' );
+				}
+			} elseif ( $key === '_sow_form_timestamp' ) {
+				$panels_data[ $key ] = (int) $value;
+			} elseif ( is_array( $value ) ) {
+				$panels_data[ $key ] = $this->normalize_render_fields( $value );
+			}
+		}
+
+		return $panels_data;
+	}
+
+	public function override_container( $container ) {
+		return SiteOrigin_Panels_Admin::is_block_editor() ? '.editor-styles-wrapper' : $container;
+	}
+
+	// If the CSS Output Location is set to Header, we need to generate the CSS early to allow for it to work as expected.
+	public function maybe_generate_layout_block_css() {
+		if ( SiteOrigin_Panels_Admin::is_block_editor() ) {
+			return;
+		}
+
+		$content = get_post_field( 'post_content', get_the_ID() );
+		if ( empty( $content ) ) {
+			return;
+		}
+
+		if ( siteorigin_panels_setting( 'output-css-header' ) != 'header' ) {
+			return;
+		}
+
+		// Okay! We're good to look for Layout Blocks.
+		$blocks = parse_blocks( $content );
+		if ( empty( $blocks ) ) {
+			return;
+		}
+
+		$blocks = array_filter( $blocks, array( $this, 'find_layout_block' ) );
+		if ( empty( $blocks ) ) {
+			return;
+		}
+
+		// Found them. Let's generate the CSS.
+		foreach ( $blocks as $block ) {
+			if (
+				empty( $block['attrs'] ) ||
+				empty( $block['attrs']['panelsData'] )
+			) {
+				continue;
+			}
+
+			$panels_data = $block['attrs']['panelsData'];
+			if ( empty( $panels_data ) ) {
+				continue;
+			}
+
+			// Use the same prepare_render_panels_data() the HTML render uses, so
+			// the CSS generated here and the rendered HTML never disagree about
+			// structure for the same panels_data on the same request.
+			$panels_data = $this->prepare_render_panels_data( $panels_data );
+			$builder_id = isset( $block['attrs']['builder_id'] ) ? $block['attrs']['builder_id'] : 'gb' . get_the_ID() . '-' . md5( serialize( $panels_data ) ) . '-';
+
+			SiteOrigin_Panels::renderer()->render(
+				$builder_id,
+				true,
+				$panels_data
+			);
+		}
+	}
+
+	public function server_side_validation( $prepared_post, $request ) {
+		if ( empty( $prepared_post->post_content ) ) {
+			return $prepared_post;
+		}
+
+		$blocks = parse_blocks( $prepared_post->post_content );
+		if ( empty( $blocks ) ) {
+			return $prepared_post;
+		}
+
+		foreach( $blocks as &$block ) {
+			$block = $this->sanitize_blocks( $block );
+		}
+
+		$prepared_post->post_content = serialize_blocks( $blocks );
+
+		return $prepared_post;
+	}
+
+	/**
+	 * Validate any Layout Block content embedded in a block-based
+	 * widget area's stored instances before the `widget_block` option is
+	 * written. Fires on EVERY save path for this option (classic widgets.php,
+	 * Customizer, REST) via the option-specific `pre_update_option_widget_block`
+	 * filter.
+	 *
+	 * No unslash/reslash handling is needed here (unlike validate_post_data()):
+	 * WP_Widget::update_callback() already runs stripslashes_deep() on the
+	 * instance before the option write, so this handler receives unslashed data.
+	 *
+	 * For a user without `unfiltered_html`, WP_Widget_Block::update() has
+	 * already wp_kses_post()'d the block content; the `&` → `&amp;` artifact
+	 * that leaves in tag-free panelsData strings is undone first (#1377, see
+	 * repair_core_kses_ampersands()).
+	 *
+	 * @param array $value Proposed new `widget_block` option value (numeric
+	 *                     widget-instance keys plus '_multiwidget').
+	 * @return array The (possibly modified) value to actually persist.
+	 */
+	public function validate_widget_block_option( $value ) {
+		if ( empty( $value ) || ! is_array( $value ) ) {
+			// Fail-closed means "do nothing to make things worse," not
+			// "invent structure that isn't there."
+			return $value;
+		}
+
+		$repair_ampersands = null;
+
+		foreach ( $value as $number => &$instance ) {
+			if ( $number === '_multiwidget' ) {
+				// Bookkeeping flag, not a widget instance.
+				continue;
+			}
+
+			if (
+				! is_array( $instance ) ||
+				empty( $instance['content'] ) ||
+				! is_string( $instance['content'] )
+			) {
+				// Nothing to sanitize for this instance.
+				continue;
+			}
+
+			$blocks = parse_blocks( $instance['content'] );
+			if ( empty( $blocks ) ) {
+				continue;
+			}
+
+			// Core kses provenance: WP_Widget_Block::update() ran wp_kses_post()
+			// over this block content for a user without unfiltered_html,
+			// turning every bare & into &amp; (see repair_core_kses_ampersands()).
+			// Same condition, so the repair applies exactly when core's kses did.
+			if ( null === $repair_ampersands ) {
+				$repair_ampersands = ! current_user_can( 'unfiltered_html' );
+			}
+
+			foreach ( $blocks as &$block ) {
+				if ( $repair_ampersands ) {
+					$block = $this->repair_core_kses_ampersands_in_blocks( $block );
+				}
+				$block = $this->sanitize_blocks( $block );
+			}
+			unset( $block );
+
+			$instance['content'] = serialize_blocks( $blocks );
+		}
+		unset( $instance );
+
+		return $value;
+	}
+
+	/**
+	 * Supplemental save-time validation for post saves that do not go through
+	 * the REST API (XML-RPC, direct wp_insert_post()/wp_update_post() calls,
+	 * importers, classic non-block-editor saves). Skips 'revision' post-type
+	 * rows (covers both plain revisions and autosaves). Each Layout Block found
+	 * is sanitized unless sanitize_block()'s same-request memo shows it was
+	 * already sanitized earlier this request (e.g. by the rest_pre_insert_*
+	 * hook), so the widget update() runs once per block per request. An
+	 * origin-untrusted write always sanitizes regardless of the memo.
+	 *
+	 * For a user without `unfiltered_html`, core's `content_save_pre` kses has
+	 * already run on this content; the `&` → `&amp;` artifact it leaves in
+	 * tag-free panelsData strings is undone before the memo check (#1377, see
+	 * repair_core_kses_ampersands()).
+	 *
+	 * @param array $data Slashed, processed post data about to be inserted/updated.
+	 * @return array The (possibly modified) $data to actually persist.
+	 */
+	public function validate_post_data( $data ) {
+		if ( ! empty( $data['post_type'] ) && $data['post_type'] === 'revision' ) {
+			// Revisions AND autosaves are both nested wp_insert_post() calls
+			// with post_type 'revision', fired on the same request as the
+			// parent post's own save. Revision rows are never independently
+			// rendered by render_layout_block(), so skipping them loses no
+			// coverage — only avoids redundant work.
+			return $data;
+		}
+
+		if ( empty( $data['post_content'] ) ) {
+			return $data;
+		}
+
+		// Slashing contract: $data['post_content'] arrives SLASHED at this
+		// filter (wp_insert_post() only unslashes AFTER wp_insert_post_data
+		// returns — wp-includes/post.php). Parsing the slashed string would
+		// leave every Layout Block's panelsData JSON undecodable (escaped
+		// quotes), which would cause serialize_blocks() to write
+		// back attrs-wiped blocks — silently DELETING panelsData. Unslash
+		// before parsing, re-slash before writing back so this field matches
+		// the slashed shape of its $data siblings. NOTE: this asymmetry versus
+		// validate_widget_block_option() is intentional — that handler
+		// receives already-unslashed data (WP_Widget::update_callback() runs
+		// stripslashes_deep() upstream); this one does not.
+		$content = wp_unslash( $data['post_content'] );
+
+		$blocks = parse_blocks( $content );
+		if ( empty( $blocks ) ) {
+			return $data;
+		}
+
+		// Cheap presence check: most post saves contain no Layout Block at
+		// all — bail before any sanitize/serialize work.
+		$has_layout_block = false;
+		foreach ( $blocks as $block ) {
+			if ( $this->find_layout_block( $block ) ) {
+				$has_layout_block = true;
+				break;
+			}
+		}
+
+		if ( ! $has_layout_block ) {
+			return $data;
+		}
+
+		// Core kses provenance: for a user without unfiltered_html, core's
+		// content_save_pre filter (wp_filter_post_kses, via kses_init_filters)
+		// has ALREADY run on this post_content before wp_insert_post_data
+		// fires, and its wp_pre_kses_block_attributes() pass turned every bare
+		// & in every panelsData string into &amp;. Undo that one artifact
+		// under the same condition core applied it (see
+		// repair_core_kses_ampersands()). This must run BEFORE
+		// sanitize_blocks() so the same-request memo in sanitize_block() sees
+		// the REST-stage output again and the widget update() is not re-run.
+		$repair_ampersands = ! current_user_can( 'unfiltered_html' );
+
+		foreach ( $blocks as &$block ) {
+			if ( $repair_ampersands ) {
+				$block = $this->repair_core_kses_ampersands_in_blocks( $block );
+			}
+			$block = $this->sanitize_blocks( $block );
+		}
+		unset( $block );
+
+		$data['post_content'] = wp_slash( serialize_blocks( $blocks ) );
+
+		return $data;
+	}
+
+	/**
+	 * Walk a parsed block tree and apply repair_core_kses_ampersands() to the
+	 * panelsData of every Layout Block found, at any depth (a Layout Block
+	 * nested inside a Group or Column block is kses'd by core just the same).
+	 *
+	 * @param array $block A parsed block (parse_blocks() shape).
+	 * @return array The block tree with every Layout Block's panelsData repaired.
+	 */
+	private function repair_core_kses_ampersands_in_blocks( $block ) {
+		if (
+			! empty( $block['blockName'] ) &&
+			$block['blockName'] === 'siteorigin-panels/layout-block' &&
+			! empty( $block['attrs']['panelsData'] ) &&
+			is_array( $block['attrs']['panelsData'] )
+		) {
+			$block['attrs']['panelsData'] = $this->repair_core_kses_ampersands( $block['attrs']['panelsData'] );
+		}
+
+		if ( ! empty( $block['innerBlocks'] ) ) {
+			foreach ( $block['innerBlocks'] as $i => $inner ) {
+				$block['innerBlocks'][ $i ] = $this->repair_core_kses_ampersands_in_blocks( $inner );
+			}
+		}
+
+		return $block;
+	}
+
+	/**
+	 * Undo the one reversible artifact WordPress core's kses leaves in a Layout
+	 * Block saved by a user without `unfiltered_html`: `&` rewritten to `&amp;`
+	 * in strings that carry no markup (#1377).
+	 *
+	 * The mechanism: for those users core registers wp_filter_post_kses() on
+	 * `content_save_pre` (kses_init_filters()), and its `pre_kses` hook
+	 * wp_pre_kses_block_attributes() → filter_block_kses_value() runs wp_kses()
+	 * over EVERY string attribute of every block, panelsData leaves included.
+	 * wp_kses() normalises a bare `&` to `&amp;`. Block widget areas hit the
+	 * same thing through WP_Widget_Block::update(), which wp_kses_post()s the
+	 * block content for those users. Neither path offers a per-block bypass.
+	 * A Widgets Bundle `posts` field stores a query string
+	 * (`post_type=post&tax_query=category:jobs`) and reads it back with
+	 * wp_parse_args(), which then sees the key `amp;tax_query` and drops the
+	 * filter. The kses floor in SiteOrigin_Panels_Admin::kses_deep() no longer
+	 * does this (Steps 1–3 of #1377); core still does.
+	 *
+	 * The repair, applied to every string leaf under panelsData['widgets']:
+	 * if the string contains NO `<` and NO `>`, replace `&amp;` with `&`.
+	 * A tag-free string cannot become markup by decoding `&amp;` (the result
+	 * still has no `<` or `>`, so `&amp;lt;script&amp;gt;` decodes to
+	 * `&lt;script&gt;`, which is still text). Strings with a `<` or `>` are
+	 * left exactly as core produced them.
+	 *
+	 * Provenance rule: call this ONLY where core kses has provably run —
+	 * validate_post_data() (after `content_save_pre`) and
+	 * validate_widget_block_option() (after WP_Widget_Block::update()) — and
+	 * only when `! current_user_can( 'unfiltered_html' )`, the exact condition
+	 * under which core applied it. NOT in server_side_validation() (core has not
+	 * run yet) and NOT keyed on $force_kses_floor (an AI write under an admin
+	 * credential forces the floor without core kses). A capable user's
+	 * intentional `&amp;` is never touched.
+	 *
+	 * This restores only that one artifact, not the original string: core's
+	 * NUL removal, numeric-entity canonicalisation and
+	 * convert_invalid_entities() stay irreversible. Accepted lossy
+	 * consequence: a user without `unfiltered_html` cannot store a literal
+	 * `&amp;` in a tag-free field; it becomes `&`, which is what it renders as.
+	 *
+	 * @param array $panels_data A Layout Block's panelsData.
+	 * @return array The panelsData with `&amp;` → `&` in tag-free widget strings.
+	 */
+	private function repair_core_kses_ampersands( $panels_data ) {
+		if ( ! is_array( $panels_data ) || empty( $panels_data['widgets'] ) || ! is_array( $panels_data['widgets'] ) ) {
+			return $panels_data;
+		}
+
+		$panels_data['widgets'] = $this->repair_core_kses_ampersands_deep( $panels_data['widgets'] );
+
+		return $panels_data;
+	}
+
+	/**
+	 * Recursive leaf worker for repair_core_kses_ampersands(). Non-string leaves
+	 * are returned as-is.
+	 *
+	 * @param mixed $value A widget instance subtree or leaf.
+	 * @return mixed
+	 */
+	private function repair_core_kses_ampersands_deep( $value ) {
+		if ( is_array( $value ) ) {
+			foreach ( $value as $key => $item ) {
+				$value[ $key ] = $this->repair_core_kses_ampersands_deep( $item );
+			}
+
+			return $value;
+		}
+
+		if (
+			is_string( $value ) &&
+			strpos( $value, '<' ) === false &&
+			strpos( $value, '>' ) === false
+		) {
+			return str_replace( '&amp;', '&', $value );
+		}
+
+		return $value;
+	}
+
+	public function sanitize_blocks( $block ) {
+		if (
+			! empty( $block['blockName'] ) &&
+			$block['blockName'] === 'siteorigin-panels/layout-block'
+		) {
+				$block = $this->sanitize_block( $block );
+		}
+
+		if ( ! empty( $block['innerBlocks'] ) ) {
+			foreach( $block['innerBlocks'] as $i => $inner ) {
+				$block['innerBlocks'][$i] = $this->sanitize_blocks( $inner );
+			}
+		}
+
+		return $block;
+	}
+
+	public function sanitize_block( $block ) {
+		if (
+			empty( $block['attrs'] ) ||
+			empty( $block['attrs']['panelsData'] ) ||
+			! is_array( $block['attrs']['panelsData'] )
+		) {
+			return $block;
+		}
+
+		// Same-request dedup: if this exact panelsData was already sanitized
+		// earlier in THIS request (the rest_pre_insert_* hook), the
+		// wp_insert_post_data safety net must not run update() on it a second
+		// time. Check the INPUT here and record the OUTPUT below: on the second
+		// hook the incoming block IS the first hook's sanitized output, so the
+		// input hash here matches the output hash recorded there. Reached at
+		// every tree depth via sanitize_blocks(), so nested Layout Blocks dedup
+		// for free.
+		//
+		// Guard on a false encode: wp_json_encode() returns false when it cannot
+		// encode (e.g. nesting past depth 512, or an unencodable value injected
+		// via a filter), and hash( 'sha256', false ) collapses to the digest of
+		// '' — so EVERY unencodable block would share one hash and a second such
+		// block would falsely hit the memo and skip sanitization. A false encode
+		// therefore neither checks nor records: it degrades to sanitizing twice,
+		// the safe direction. (The same false-encode guard is required anywhere a
+		// hash of wp_json_encode() output is used as a key or identity.)
+		// Never consult the memo for an origin-untrusted write: sanitize_block_untrusted()
+		// sets $force_kses_floor and an untrusted write MUST always sanitize, or a
+		// memo entry seeded earlier this request (e.g. a capable author's no-op
+		// sanitize of the same raw markup) would let it skip the forced floor and
+		// store the content unfloored — an Audit #1 contract break. The OUTPUT is
+		// still recorded below unconditionally, so the wp_insert_post_data safety
+		// net that follows an untrusted write still dedups.
+		$incoming_encoded = wp_json_encode( $block['attrs']['panelsData'] );
+		if (
+			! $this->force_kses_floor &&
+			false !== $incoming_encoded &&
+			isset( $this->sanitized_this_request[ hash( 'sha256', $incoming_encoded ) ] )
+		) {
+			return $block;
+		}
+
+		// Save/restore the PRIOR value (not hard true) via try/finally: restore
+		// keeps a thrown widget update() from leaving the flag stuck on the save
+		// branch, and preserving the prior value keeps a re-entrant sanitize_block()
+		// — reachable when the AI pre-save filter runs a nested block write — from
+		// flipping the OUTER call back to the render branch mid-save.
+		$previous_return_layout = $this->return_layout;
+		$this->return_layout = false;
+		try {
+			$block['attrs'] = $this->render_layout_block( $block['attrs'] );
+		} finally {
+			$this->return_layout = $previous_return_layout;
+		}
+		unset( $block['innerHTML'] );
+		if ( ! empty( $block['attrs']['renderedLayout'] ) ) {
+			unset( $block['attrs']['renderedLayout'] );
+		}
+
+		// Record the OUTPUT: on the second hook of the same request this
+		// sanitized panelsData is what arrives as the incoming block, so hashing
+		// the output here is what the input check above will match. A re-entrant
+		// nested sanitize_block() (AI pre-save filter running a nested block
+		// write) records its own output first, then the outer records its own —
+		// the outer already passed its input check before the inner ran.
+		if (
+			! empty( $block['attrs']['panelsData'] ) &&
+			is_array( $block['attrs']['panelsData'] )
+		) {
+			// Same false-encode guard as the input check: never record the
+			// digest of '' (what hash( 'sha256', false ) yields), or two
+			// unencodable blocks would collide on it and the second would skip
+			// sanitization.
+			$output_encoded = wp_json_encode( $block['attrs']['panelsData'] );
+			if ( false !== $output_encoded ) {
+				$this->sanitized_this_request[ hash( 'sha256', $output_encoded ) ] = true;
+			}
+		}
+
+		return $block;
+	}
+
+	/**
+	 * Sanitize a Layout Block whose content origin is untrusted, forcing the
+	 * kses floor regardless of the current user's capabilities.
+	 *
+	 * Entry point for AI ability writes (see inc/abilities.php): AI output is
+	 * prompt-injectable no matter whose credential carries the request, so an
+	 * admin application password must not exempt it from the floor the way it
+	 * would exempt the author's own content. Runs the full save chokepoint —
+	 * the `siteorigin_panels_ai_block_layout_pre_save` filter, strict
+	 * sanitize, then the forced floor — in one pass.
+	 *
+	 * The flag restore uses try/finally because it guards a security floor; if
+	 * an exception did escape, a stuck-true flag would only over-floor later
+	 * saves in the same request — fail-closed. It restores the PRIOR value
+	 * rather than a hard false so a re-entrant call (a consumer of the
+	 * siteorigin_panels_ai_block_layout_pre_save filter or widget_update_callback
+	 * calling this method on a sub-layout, both of which run while the outer
+	 * flag is true) cannot clear the outer write's floor when the inner call
+	 * returns.
+	 *
+	 * @param array $block A parsed Layout Block (parse_blocks() shape).
+	 * @return array The block with sanitized, floored panelsData.
+	 */
+	public function sanitize_block_untrusted( $block ) {
+		$previous = $this->force_kses_floor;
+		$this->force_kses_floor = true;
+
+		try {
+			$block = $this->sanitize_block( $block );
+		} finally {
+			$this->force_kses_floor = $previous;
+		}
+
+		return $block;
+	}
+
+	/**
+	 * Sanitize the target Layout Block of a layout-update ability write.
+	 *
+	 * Entry point for the `siteorigin-panels/layout-update` ability only. Runs
+	 * the same chokepoint as sanitize_block_untrusted(), with the kses floor
+	 * forced, and marks this block's save so that the save branch settles the
+	 * stored form, checks it with
+	 * SiteOrigin_Panels_Admin::validate_layout_structure(), and then fires the
+	 * `siteorigin_panels_layout_update_pre_write` hook once, before the block's
+	 * render. A stored form the builder cannot load stops the write with the
+	 * code `siteorigin_panels_layout_update_unresolved_reference`; the hook
+	 * does not fire and nothing is rendered. If the block has no layout data,
+	 * nothing is sanitized, checked or rendered, and the hook still fires once
+	 * with an empty layout.
+	 *
+	 * Widgets that equal a widget of $stored keep their stored value; every
+	 * other widget is floored. A layout holding a cycle stops the write with
+	 * the code `siteorigin_panels_layout_update_unsupported_value`.
+	 *
+	 * @param array      $block       A parsed Layout Block (parse_blocks() shape).
+	 * @param int        $post_id     The post being written.
+	 * @param int        $block_index 0-based Layout Block index, as in layout-get.
+	 * @param array|null $stored      The block's stored panelsData, as parsed from post_content.
+	 * @param array      $object_keys Widget keys that arrived as objects; they are never kept.
+	 *
+	 * @throws SiteOrigin_Panels_Layout_Update_Aborted When the hook stops the write, the stored form does not settle,
+	 *                                                 the builder cannot load the stored form, or the layout holds
+	 *                                                 a value that cannot be saved.
+	 *
+	 * @return array The block with sanitized, floored panelsData.
+	 */
+	public function sanitize_block_for_layout_update( $block, $post_id, $block_index, $stored = null, $object_keys = array() ) {
+		if ( isset( $block['attrs']['panelsData'] ) && is_array( $block['attrs']['panelsData'] ) ) {
+			SiteOrigin_Panels_Layout_Update_Unchanged::assert_walkable( $block['attrs']['panelsData'] );
+			SiteOrigin_Panels_Layout_Update_Pre_Write::assert_supported_values( $block['attrs']['panelsData'] );
+		}
+
+		$previous = $this->layout_update_pre_write;
+		$this->layout_update_pre_write = array(
+			'post_id'     => (int) $post_id,
+			'block_index' => (int) $block_index,
+			'stored'      => is_array( $stored ) ? $stored : null,
+			'object_keys' => is_array( $object_keys ) ? $object_keys : array(),
+		);
+
+		try {
+			$block = $this->sanitize_block_untrusted( $block );
+			$fired = ( null === $this->layout_update_pre_write );
+		} finally {
+			$this->layout_update_pre_write = $previous;
+		}
+
+		if ( ! $fired ) {
+			// sanitize_block() returned early: the block has no layout data,
+			// so nothing was sanitized or rendered. Fire the hook here.
+			SiteOrigin_Panels_Layout_Update_Pre_Write::run(
+				( isset( $block['attrs']['panelsData'] ) && is_array( $block['attrs']['panelsData'] ) ) ? $block['attrs']['panelsData'] : array(),
+				$post_id,
+				'block',
+				(int) $block_index
+			);
+		}
+
+		return $block;
+	}
+
+	public function find_layout_block( $block ) {
+		$found_blocks = array();
+
+		if ( ! empty( $block['blockName'] ) && $block['blockName'] === 'siteorigin-panels/layout-block' ) {
+			$found_blocks[] = $block;
+		}
+
+		if ( ! empty( $block['innerBlocks'] ) ) {
+			foreach( $block['innerBlocks'] as $inner ) {
+				$inner_blocks = $this->find_layout_block( $inner );
+				$found_blocks = array_merge( $found_blocks, $inner_blocks );
+			}
+		}
+
+		return $found_blocks;
+	}
+}

@@ -1,0 +1,82 @@
+<?php
+
+/*
+Plugin Name: AI Engine
+Plugin URI: https://wordpress.org/plugins/ai-engine/
+Description: AI meets WordPress. Your site can now chat, write poetry, solve problems, and maybe make you coffee.
+Version: 3.9.2
+Requires at least: 6.0
+Requires PHP: 8.1
+Author: Jordy Meow
+Author URI: https://jordymeow.com
+Text Domain: ai-engine
+License: GPLv2 or later
+License URI: https://www.gnu.org/licenses/gpl-2.0.html
+*/
+
+// Free and Pro both active: WordPress loads Pro first ("ai-engine-pro/" sorts before
+// "ai-engine/"), so the second copy stops here. Checking before the constants matters:
+// redefining them logs a PHP 8 warning on every request.
+if ( defined( 'MWAI_VERSION' ) ) {
+  add_action( 'admin_notices', function () {
+    echo '<div class="error"><p>' . esc_html__( 'Thanks for installing the Pro version of AI Engine :) However, the free version is still enabled. Please disable or uninstall it.', 'ai-engine' ) . '</p></div>';
+  } );
+  return;
+}
+
+define( 'MWAI_VERSION', '3.9.2' );
+define( 'MWAI_PREFIX', 'mwai' );
+define( 'MWAI_DOMAIN', 'ai-engine' );
+define( 'MWAI_ENTRY', __FILE__ );
+define( 'MWAI_PATH', dirname( __FILE__ ) );
+define( 'MWAI_URL', plugin_dir_url( __FILE__ ) );
+define( 'MWAI_ITEM_ID', 17631833 );
+if ( !defined( 'MWAI_TIMEOUT' ) ) {
+  define( 'MWAI_TIMEOUT', 60 * 5 );
+}
+if ( !defined( 'MWAI_SSL_VERIFY' ) ) {
+  // Verify TLS certificates by default (matches WordPress core). Outbound calls
+  // carry provider API keys, so disabling verification would expose them to MITM.
+  // Self-hosted endpoints with self-signed certs can opt out by defining this as
+  // false in wp-config.php.
+  define( 'MWAI_SSL_VERIFY', true );
+}
+// What a fresh install lands on, and what anything without an explicit model falls back to.
+// These must never point at a model tagged 'deprecated' in constants/models.php: the admin
+// then shows a deprecation warning on a brand new site. Re-check them whenever a model is
+// tagged deprecated there.
+define( 'MWAI_FALLBACK_MODEL', 'gpt-5.6-terra' );
+define( 'MWAI_FALLBACK_MODEL_FAST', 'gpt-5.6-luna' );
+define( 'MWAI_FALLBACK_MODEL_VISION', 'gpt-5.6-luna' );
+define( 'MWAI_FALLBACK_MODEL_JSON', 'gpt-5.6-luna' );
+define( 'MWAI_FALLBACK_MODEL_IMAGES', 'gpt-image-2' );
+define( 'MWAI_FALLBACK_MODEL_AUDIO', 'gpt-transcribe' );
+define( 'MWAI_FALLBACK_MODEL_EMBEDDINGS', 'text-embedding-3-small' );
+
+require_once( MWAI_PATH . '/classes/init.php' );
+
+add_filter( 'mwai_ai_exception', function ( $exception ) {
+  try {
+    // Remove the service prefix if present
+    if ( strpos( $exception, 'OpenAI:' ) === 0 ) {
+      $exception = trim( substr( $exception, strlen( 'OpenAI:' ) ) );
+    }
+
+    // If the remaining string looks like JSON, try to decode it
+    $json = json_decode( $exception, true );
+    if ( is_array( $json ) && isset( $json['error']['message'] ) ) {
+      $exception = $json['error']['message'];
+    }
+
+    if ( strpos( $exception, 'OpenAI' ) !== false ) {
+      if ( strpos( $exception, 'API URL was not found' ) !== false ) {
+        return "Received the 'API URL was not found' error from OpenAI. This actually means that your OpenAI account has not been enabled for the Chat API. You need to either add some credits to OpenAI account, or link a credit card to it.";
+      }
+    }
+    return $exception;
+  }
+  catch ( Exception $e ) {
+    error_log( $e->getMessage() );
+  }
+  return $exception;
+} );

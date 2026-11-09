@@ -1,0 +1,2021 @@
+<?php
+
+/**
+* AI Engine MCP Server
+*
+* This class implements a Model Context Protocol (MCP) server for AI Engine.
+*
+* Current Implementation:
+* - Single Streamable HTTP endpoint (/mcp/v1/http), used by Claude, Claude Code and ChatGPT
+* - Authentication via OAuth (see mcp-oauth.php) or a static bearer token
+* - Optional URL-token endpoint (/mcp/v1/{token}) for clients that cannot send headers
+* - Properly handles agent cancellation signals (notifications/cancelled) to free workers immediately
+* - Caps how long an idle stream holds a PHP worker (see Connection Management below)
+* - Sends heartbeat signals to detect dead connections quickly
+*
+* The legacy SSE transport (/mcp/v1/sse plus /messages, driven by a bundled mcp.js Node
+* relay) was removed in 3.6, once the MCP spec retired it. Streamable HTTP still answers
+* with text/event-stream framing, which is why the SSE handling below is still needed.
+*
+* Connection Management:
+* - Agents send notifications/cancelled when done, triggering immediate stream closure
+* - An idle timeout frees the worker even when agents forget to disconnect. It is
+*   180 seconds normally, and 30 seconds when MCP debug logging is on. Size PHP
+*   workers off 180s, not 30s: an agent that opens streams and never sends DELETE
+*   holds one worker per stream for the full three minutes. Override with the
+*   mwai_mcp_stream_max_time filter (see below) if that is too long for the host.
+* - Heartbeat comments (every 10s) help proxies and connection_aborted() detect dead sockets
+*/
+
+class Meow_MWAI_Labs_MCP {
+  private $core = null;
+  private $namespace = 'mcp/v1';
+  private $server_version = '0.0.1';
+  private $protocol_version = '2025-06-18';
+  private $supported_protocol_versions = [ '2024-11-05', '2025-06-18' ];
+  private $queue_key = 'mwai_mcp_msg';
+  private $session_id = null;
+  private $logging = false;
+  private $last_action_time = 0;
+  private $bearer_token = null;
+  private $mcp_role = 'admin';
+  private $tool_access_levels = [];
+  // Tools that can change the site, for the MCP tab's "changes" (see is_write_call()).
+  private $tool_writes = [];
+  // Tools with an "action" argument (list, get, update…): whether a call writes depends on it.
+  private $tool_mixed = [];
+  private $tool_levels_raw = [];
+  // Tools that come from WordPress Abilities (labs/mcp-abilities.php).
+  private $tool_abilities = [];
+  // A level other than 'read' says who may call a tool, not that it writes: 'admin' guards
+  // reads too (wp_get_users, wp_get_option, a theme's AI generator). So a change also needs a
+  // write verb in the name, or in the "action" argument of a tool that does several things.
+  private const WRITE_VERBS = '/(^|[_-])(create|update|delete|set|add|remove|upload|write|alter|edit|publish|insert|move|trash|import|replace|assign|activate|deactivate|install|uninstall|switch|translate|link|send|schedule|restore|duplicate|approve|reply|mark|copy|rename|mkdir|put|cancel|refund|resolve|merge|subscribe|unsubscribe|revoke|enable|disable|reset|clear|purge|save|sync|empty|close)([_-]|$)/i';
+  // Set when the OAuth grant was approved as Read-only: only 'read' tools are listed or run.
+  /** Tools that delete or change the site beyond content: always flagged destructive for clients. */
+  public const RISKY_TOOLS = [
+    'wp_delete_post', 'wp_delete_media', 'wp_delete_term', 'wp_delete_comment', 'wp_delete_note',
+    'wp_delete_post_meta', 'wp_delete_plugin', 'wp_delete_theme', 'wp_plugin_delete_path',
+    'wp_theme_delete_path', 'wc_delete_product', 'wc_delete_review', 'wp_update_option',
+    'wp_activate_plugin', 'wp_deactivate_plugin', 'wp_install_plugin', 'wp_install_theme',
+    'wp_update_plugin', 'wp_update_theme', 'wp_switch_theme', 'wp_create_user', 'wp_update_user',
+    'wp_plugin_alter_file', 'wp_theme_alter_file', 'wp_db_query', 'wc_bulk_update_stock',
+  ];
+
+  private $read_only_grant = false;
+  // Placeholder for OAuth integration. Currently unused and kept for
+  // future implementation once the security model is revised.
+  private $oauth = null;
+  // Resolved during auth so the MCP Logs feature can attribute tool calls
+  // to a specific connector (Claude, ChatGPT, Claude Code, …) or 'bearer'.
+  // Lives on the instance for the duration of one HTTP request.
+  private $auth_client_id = null;
+  private $auth_client_name = null;
+  private $auth_method = null; // 'oauth' | 'bearer' | null
+  // An OAuth user without manage_options (an Editor, when "Editor Access" is on):
+  // content tools only, each call checked against that user's own capabilities.
+  private $limited_session = false;
+
+  // Exception code a tool callback throws to report a refused call as 'denied' in
+  // MCP Logs. Deliberately not 403: tools that relay an HTTP error must not match.
+  public const DENIED_CODE = 40301;
+
+  // What a limited session may call. An explicit list rather than the read/write
+  // levels: those levels also cover things an Editor must not reach (the plugin list,
+  // third-party and Pro module tools, some of which switch to an administrator).
+  public const LIMITED_SESSION_TOOLS = [
+    'mcp_ping',
+    'wp_get_posts', 'wp_get_post', 'wp_get_post_snapshot', 'wp_get_post_types', 'wp_count_posts',
+    'wp_create_post', 'wp_update_post', 'wp_alter_post', 'wp_write_blocks', 'wp_get_blocks', 'wp_edit_blocks',
+    'wp_list_block_patterns', 'wp_insert_block_pattern',
+    'wp_get_post_meta', 'wp_update_post_meta',
+    'wp_get_taxonomies', 'wp_get_terms', 'wp_count_terms', 'wp_get_post_terms',
+    'wp_create_term', 'wp_update_term', 'wp_add_post_terms',
+    'wp_get_comments', 'wp_create_comment', 'wp_update_comment',
+    'wp_create_note', 'wp_update_note', 'wp_delete_note',
+    'wp_get_media', 'wp_count_media', 'wp_upload_media', 'wp_upload_request', 'wp_update_media',
+    'wp_set_featured_image', 'mwai_vision', 'mwai_image',
+    'mcp_list_changes', 'mcp_undo_change', 'wp_get_seo', 'wp_update_seo', 'acf_get_fields', 'acf_update_fields',
+    'wp_get_rendered', 'wp_get_revisions', 'wp_restore_revision', 'wp_moderate_comments', 'wp_preview_link',
+    'wp_get_shortcodes', 'wp_edit_shortcodes',
+  ];
+
+  #region Initialize
+  public function __construct( $core ) {
+    $this->core = $core;
+
+    // Set logging based on option
+    $this->logging = $this->core->get_option( 'mcp_debug_mode', false );
+
+    // OAuth 2.1 with Dynamic Client Registration. Lives alongside the bearer
+    // token: bearer is for dev tools (Claude Code, scripts), OAuth is for
+    // browser-driven clients like Claude Desktop. The new module enforces
+    // strict redirect_uri matching, PKCE S256, and refresh-token rotation.
+    require_once __DIR__ . '/mcp-oauth.php';
+    $this->oauth = new Meow_MWAI_Labs_MCP_OAuth( $core, $this );
+    require_once __DIR__ . '/mcp-usage.php';
+    new Meow_MWAI_Labs_MCP_Usage( $this );
+    require_once __DIR__ . '/mcp-undo.php';
+
+    add_action( 'rest_api_init', [ $this, 'rest_api_init' ] );
+  }
+
+  public function is_logging_enabled() {
+    return $this->logging;
+  }
+
+  public function rest_api_init() {
+    // Load bearer token if not already loaded
+    if ( $this->bearer_token === null ) {
+      $this->bearer_token = $this->core->get_option( 'mcp_bearer_token' );
+    }
+    $this->mcp_role = $this->core->get_option( 'mcp_role', 'admin' );
+
+    // Auth filter runs for both bearer token and OAuth token paths; register
+    // unconditionally so that OAuth-only deployments (no static bearer set) work.
+    static $filter_added = false;
+    if ( !$filter_added ) {
+      add_filter( 'mwai_allow_mcp', [ $this, 'auth_via_bearer_token' ], 10, 2 );
+      $filter_added = true;
+    }
+
+    // Extend the CORS allow-headers list for our MCP routes. The Streamable HTTP
+    // transport sends Mcp-Protocol-Version and Mcp-Session-Id on every request;
+    // WP core's default allow-list does not include them, so the browser-side
+    // preflight from claude.ai (and similar web connectors) was rejecting the
+    // actual POST and the client reported "Couldn't reach the MCP server".
+    add_filter( 'rest_allowed_cors_headers', function ( $headers ) {
+      $uri = isset( $_SERVER['REQUEST_URI'] ) ? (string) $_SERVER['REQUEST_URI'] : '';
+      if ( strpos( $uri, '/' . $this->namespace . '/' ) === false ) {
+        return $headers;
+      }
+      foreach ( [ 'Mcp-Protocol-Version', 'Mcp-Session-Id', 'Accept' ] as $h ) {
+        if ( !in_array( $h, $headers, true ) ) {
+          $headers[] = $h;
+        }
+      }
+      return $headers;
+    } );
+
+    // Streamable HTTP endpoint (modern MCP transport). Always registered when
+    // the MCP module is enabled — auth is enforced by can_access_mcp(), which
+    // accepts either a bearer token or an OAuth access token.
+    register_rest_route( $this->namespace, '/http', [
+      'methods' => [ 'GET', 'POST', 'DELETE' ],
+      'callback' => [ $this, 'handle_streamable_http' ],
+      'permission_callback' => function ( $request ) {
+        return $this->can_access_mcp( $request );
+      },
+      'show_in_index' => false,
+    ] );
+
+    // Alternative endpoint with bearer token embedded in URL path, for clients
+    // that cannot send Authorization headers. Only registered when a bearer
+    // token is configured. The token is high-entropy (wp_generate_password),
+    // compared with hash_equals, and the route is hidden (show_in_index=false).
+    // Kept because Claude Code and other MCP connectors currently work more
+    // reliably this way when proxies strip the Authorization header.
+    // TODO: Re-evaluate after 2026-12-27. Check whether connectors still need
+    // the URL-token fallback, or if header/OAuth auth has become reliable enough
+    // to deprecate it (flagged by WP.org automated security review, Jun 2026).
+    if ( !empty( $this->bearer_token ) ) {
+      register_rest_route( $this->namespace, '/' . $this->bearer_token, [
+        'methods' => [ 'GET', 'POST', 'DELETE' ],
+        'callback' => [ $this, 'handle_streamable_http' ],
+        'permission_callback' => function ( $request ) {
+          return $this->handle_noauth_access_streamable( $request );
+        },
+        'show_in_index' => false,
+      ] );
+    }
+
+    // File upload endpoint for wp_upload_request
+    // Uses a one-time token in the URL for authentication (no bearer header needed from curl)
+    register_rest_route( $this->namespace, '/upload/(?P<token>[a-zA-Z0-9]+)', [
+      'methods' => 'POST',
+      'callback' => [ $this, 'handle_upload' ],
+      'permission_callback' => '__return_true',
+      'show_in_index' => false,
+    ] );
+  }
+  #endregion
+
+  #region Auth (Bearer token)
+  /**
+  * SECURITY: MCP provides powerful WordPress management capabilities, so access must be strictly controlled.
+  *
+  * By default, only administrators can access MCP endpoints. This prevents lower-privileged users
+  * (subscribers, contributors, etc.) from executing dangerous operations like creating admin users,
+  * deleting content, or modifying settings.
+  *
+  * When a bearer token is configured, it overrides the default admin check, but access is DENIED
+  * unless a valid token is provided. This ensures MCP is secure even with default settings.
+  *
+  * OAuth tokens are checked in auth_via_bearer_token(). When Editor Access is on, an Editor's
+  * token is accepted too, as a limited session (see limited_session_refusal()).
+  */
+  public function can_access_mcp( $request ) {
+    // Default to requiring administrator capability for security. Checked via
+    // manage_options rather than the 'administrator' role name, so that
+    // admin-equivalent accounts (custom roles, individually granted caps) are
+    // not locked out. Same reasoning as user_can_authorize() in mcp-oauth.php.
+    $is_admin = current_user_can( 'manage_options' );
+    return apply_filters( 'mwai_allow_mcp', $is_admin, $request );
+  }
+
+  public function auth_via_bearer_token( $allow, $request ) {
+    // Skip if already authenticated as admin
+    if ( $allow ) {
+      return $allow;
+    }
+
+    $hdr = Meow_MWAI_Labs_MCP_OAuth::authorization_header( $request );
+
+    // If no authorization header but bearer token is configured, deny access
+    if ( !$hdr && !empty( $this->bearer_token ) ) {
+      if ( $this->logging ) {
+        error_log( '[AI Engine MCP] ❌ No authorization header provided. Server may be stripping headers.' );
+      }
+      return false;
+    }
+
+    // Check for Bearer token in header
+    if ( $hdr && preg_match( '/Bearer\s+(.+)/i', $hdr, $m ) ) {
+      $token = trim( $m[1] );
+      $auth_result = 'none';
+
+      // Check if it's an OAuth token
+      if ( $this->oauth ) {
+        $token_data = $this->oauth->validate_token( $token );
+        if ( $token_data ) {
+          // Defense in depth, checked on every request: the linked user must still be
+          // allowed to authorize. A demoted user, or an Editor after the site owner
+          // turned Editor Access off, is refused on the next call, not when the token
+          // expires.
+          if ( !$this->oauth->user_can_authorize( $token_data['user_id'] ) ) {
+            if ( $this->logging ) {
+              error_log( '[AI Engine MCP] ❌ OAuth token rejected: user ' . $token_data['user_id'] . ' is no longer allowed to use MCP.' );
+            }
+            return false;
+          }
+          // Set current user based on OAuth token
+          wp_set_current_user( $token_data['user_id'] );
+          $auth_result = 'oauth';
+          $this->auth_method = 'oauth';
+          $this->limited_session = !user_can( $token_data['user_id'], 'manage_options' );
+          $this->read_only_grant = ( $token_data['scope'] ?? '' ) === Meow_MWAI_Labs_MCP_OAuth::SCOPE_READ;
+          $this->auth_client_id = $token_data['client_id'] ?? null;
+          $this->auth_client_name = $token_data['client_name'] ?? null;
+          return true;
+        }
+      }
+
+      // Fall back to static bearer token if configured
+      if ( !empty( $this->bearer_token ) && hash_equals( $this->bearer_token, $token ) ) {
+        if ( $admin = $this->core->get_admin_user() ) {
+          wp_set_current_user( $admin->ID, $admin->user_login );
+        }
+        $auth_result = 'static';
+        $this->auth_method = 'bearer';
+        $this->auth_client_id = 'bearer';
+        $this->auth_client_name = null;
+        if ( $this->logging ) {
+          error_log( '[AI Engine MCP] 🔐 Bearer token auth OK' );
+        }
+        return true;
+      }
+
+      if ( $this->logging && $auth_result === 'none' ) {
+        error_log( '[AI Engine MCP] ❌ Bearer token invalid.' );
+      }
+      // Explicitly deny access for invalid tokens
+      return false;
+    }
+
+    // ?token=xyz fallback (optional) - only for static bearer token
+    if ( !empty( $this->bearer_token ) ) {
+      $q = sanitize_text_field( $request->get_param( 'token' ) );
+      if ( $q && hash_equals( $this->bearer_token, $q ) ) {
+        if ( $admin = $this->core->get_admin_user() ) {
+          wp_set_current_user( $admin->ID, $admin->user_login );
+        }
+        $this->auth_method = 'bearer';
+        $this->auth_client_id = 'bearer';
+        return true;
+      }
+    }
+
+    // If bearer token is configured but no valid auth provided, deny access
+    if ( !empty( $this->bearer_token ) ) {
+      return false;
+    }
+
+    return $allow;
+  }
+
+  public function handle_noauth_access_streamable( $request ) {
+    // For Streamable HTTP with token in URL path (no trailing slash)
+    $route = $request->get_route();
+    $expected = '/' . $this->namespace . '/' . $this->bearer_token;
+    if ( $route !== $expected ) {
+      if ( $this->logging ) {
+        error_log( '[AI Engine MCP] ❌ Invalid Streamable HTTP no-auth URL access attempt.' );
+      }
+      return false;
+    }
+
+    // Set the current user to admin since token is valid
+    if ( $admin = $this->core->get_admin_user() ) {
+      wp_set_current_user( $admin->ID, $admin->user_login );
+    }
+    $this->auth_method = 'bearer';
+    $this->auth_client_id = 'bearer';
+    return true;
+  }
+
+  #endregion
+
+  #region Helpers (log / JSON-RPC utils)
+  /**
+   * Release the PHP session lock as early as possible. Long MCP calls (e.g. content
+   * mutations on large posts) can otherwise serialize behind any other request from the
+   * same client that opened a session, since PHP holds an exclusive write lock on the
+   * session file for the lifetime of the request. The result is the ~max_execution_time
+   * hangs operators see on busy sites. Closing the session is idempotent and safe — if
+   * no session is active the call is a no-op.
+   */
+  private function release_session_lock(): void {
+    if ( function_exists( 'session_status' ) && session_status() === PHP_SESSION_ACTIVE ) {
+      session_write_close();
+    }
+  }
+
+  private function log( $msg ) {
+    // This method is for internal UI logs - keep it minimal
+    if ( $this->logging ) {
+      // Only log important messages to UI
+      if ( strpos( $msg, 'queued' ) === false && strpos( $msg, 'flush' ) === false ) {
+        Meow_MWAI_Logging::log( "[AI Engine MCP] {$msg}" );
+      }
+    }
+  }
+
+  /** Wrap a JSON-RPC error object */
+  private function rpc_error( $id, int $code, string $msg, $extra = null ): array {
+    $err = [ 'code' => $code, 'message' => $msg ];
+    if ( $extra !== null ) {
+      $err['data'] = $extra;
+    }
+    return [ 'jsonrpc' => '2.0', 'id' => $id, 'error' => $err ];
+  }
+
+  /** Format tool result for MCP protocol */
+  private function format_tool_result( $result ): array {
+    // If result is a string, wrap it in the MCP content format
+    if ( is_string( $result ) ) {
+      return [
+        'content' => [
+          [
+            'type' => 'text',
+            'text' => $result,
+          ],
+        ],
+      ];
+    }
+
+    // If result has 'content' key, assume it's already properly formatted
+    if ( is_array( $result ) && isset( $result['content'] ) ) {
+      return $result;
+    }
+
+    // If result is an array without 'content' key, wrap it as JSON
+    if ( is_array( $result ) ) {
+      return [
+        'content' => [
+          [
+            'type' => 'text',
+            'text' => wp_json_encode( $result, JSON_PRETTY_PRINT ),
+          ],
+        ],
+        'data' => $result,
+      ];
+    }
+
+    // For any other type, convert to string and wrap
+    return [
+      'content' => [
+        [
+          'type' => 'text',
+          'text' => (string) $result,
+        ],
+      ],
+    ];
+  }
+  #endregion
+
+  #region Handle direct JSON-RPC
+  /**
+  * Shared JSON-RPC processor: takes a decoded request body, dispatches the method,
+  * and returns an immediate WP_REST_Response. Used by the Streamable HTTP POST handler
+  * (the modern transport for Claude Desktop, Claude.ai, ChatGPT, Claude Code).
+  */
+  private function handle_direct_jsonrpc( WP_REST_Request $request, $data ) {
+    $this->release_session_lock();
+    $id = $data['id'] ?? null;
+    $method = $data['method'] ?? null;
+
+    if ( json_last_error() !== JSON_ERROR_NONE ) {
+      $response = new WP_REST_Response( [
+        'jsonrpc' => '2.0',
+        'id' => null,
+        'error' => [ 'code' => -32700, 'message' => 'Parse error: invalid JSON' ]
+      ], 200 );
+      $response->set_headers( [ 'Content-Type' => 'application/json' ] );
+      $session_header = $request->get_header( 'mcp-session-id' );
+      if ( !empty( $session_header ) ) {
+        return $this->attach_session_header( $response, sanitize_text_field( $session_header ) );
+      }
+      return $response;
+    }
+
+    if ( !is_array( $data ) || !$method ) {
+      $response = new WP_REST_Response( [
+        'jsonrpc' => '2.0',
+        'id' => $id,
+        'error' => [ 'code' => -32600, 'message' => 'Invalid Request' ]
+      ], 200 );
+      $response->set_headers( [ 'Content-Type' => 'application/json' ] );
+      $session_header = $request->get_header( 'mcp-session-id' );
+      if ( !empty( $session_header ) ) {
+        return $this->attach_session_header( $response, sanitize_text_field( $session_header ) );
+      }
+      return $response;
+    }
+
+    // MCP 2026-07-28 dropped the initialize handshake: each request carries its version in
+    // _meta. We only speak the earlier, initialize-based versions. Answering such a request
+    // anyway made ChatGPT treat us as a 2026-07-28 server and reject every result for missing
+    // "resultType". The spec wants a plain 400 from an older server (not the modern -32022
+    // error, which would mark us as modern), so the client falls back to initialize.
+    $modern_version = $data['params']['_meta']['io.modelcontextprotocol/protocolVersion'] ?? null;
+    if ( is_string( $modern_version ) && $method !== 'initialize' ) {
+      if ( $this->logging ) {
+        error_log( "[AI Engine MCP] Client sent a {$modern_version} request without initialize; answering 400 so it falls back." );
+      }
+      $response = new WP_REST_Response( [
+        'jsonrpc' => '2.0',
+        'id' => $id,
+        'error' => [
+          'code' => -32600,
+          'message' => 'This server uses the initialize handshake. Supported protocol versions: ' . implode( ', ', $this->supported_protocol_versions ) . '.',
+        ],
+      ], 400 );
+      $response->set_headers( [ 'Content-Type' => 'application/json' ] );
+      return $response;
+    }
+
+    $session_header = $request->get_header( 'mcp-session-id' );
+    $session_id = '';
+    if ( !empty( $session_header ) ) {
+      $session_id = sanitize_text_field( $session_header );
+    }
+
+    if ( $method === 'initialize' || empty( $session_id ) ) {
+      $session_id = wp_generate_uuid4();
+      if ( $this->logging ) {
+        error_log( '[AI Engine MCP] 🆔 Direct session initialized: ' . $session_id );
+      }
+    }
+
+    try {
+      $reply = null;
+
+      switch ( $method ) {
+        case 'initialize':
+          // Check if client requests a specific protocol version
+          $params = $data['params'] ?? [];
+          $requested_version = $params['protocolVersion'] ?? null;
+          $client_info = $params['clientInfo'] ?? null;
+
+          if ( $this->logging && $client_info ) {
+            $client_name = $client_info['name'] ?? 'unknown';
+            $client_version = $client_info['version'] ?? 'unknown';
+            error_log( "[AI Engine MCP] Client: {$client_name} v{$client_version}" );
+          }
+
+          // Negotiate protocol version: use client's version if supported
+          $negotiated_version = $this->protocol_version;
+          if ( $requested_version && in_array( $requested_version, $this->supported_protocol_versions, true ) ) {
+            $negotiated_version = $requested_version;
+          }
+          else if ( $requested_version && $requested_version !== $this->protocol_version ) {
+            if ( $this->logging ) {
+              Meow_MWAI_Logging::warn( "[AI Engine MCP] Client requested unsupported protocol version {$requested_version}" );
+            }
+          }
+
+          $reply = [
+            'jsonrpc' => '2.0',
+            'id' => $id,
+            'result' => [
+              'protocolVersion' => $negotiated_version,
+              'serverInfo' => (object) [
+                'name' => 'AI Engine - ' . get_bloginfo( 'name' ),
+                'version' => $this->server_version,
+              ],
+              'capabilities' => (object) [
+                'tools' => new stdClass(),
+                'prompts' => new stdClass(),
+              ],
+              'instructions' => $this->instructions(),
+            ],
+          ];
+          break;
+
+        case 'prompts/list':
+          $reply = [
+            'jsonrpc' => '2.0',
+            'id' => $id,
+            'result' => [ 'prompts' => array_map( function ( $prompt ) {
+              unset( $prompt['text'] );
+              return $prompt;
+            }, $this->prompts() ) ],
+          ];
+          break;
+
+        case 'prompts/get':
+          $name = (string) ( $data['params']['name'] ?? '' );
+          $args = (array) ( $data['params']['arguments'] ?? [] );
+          $found = null;
+          foreach ( $this->prompts() as $prompt ) {
+            if ( $prompt['name'] === $name ) {
+              $found = $prompt;
+            }
+          }
+          $reply = $found ? [
+            'jsonrpc' => '2.0',
+            'id' => $id,
+            'result' => [
+              'description' => $found['description'],
+              'messages' => [ [ 'role' => 'user', 'content' => [ 'type' => 'text', 'text' => $found['text']( $args ) ] ] ],
+            ],
+          ] : [
+            'jsonrpc' => '2.0',
+            'id' => $id,
+            'error' => [ 'code' => -32602, 'message' => "Unknown prompt: {$name}" ],
+          ];
+          break;
+
+        case 'tools/list':
+          $tools = $this->get_tools_list();
+
+          // Debug logging for tools/list
+          if ( $this->logging ) {
+            $user_agent = isset( $_SERVER['HTTP_USER_AGENT'] ) ? $_SERVER['HTTP_USER_AGENT'] : 'unknown';
+            error_log( '[AI Engine MCP Direct] 📋 tools/list requested by: ' . $user_agent );
+            error_log( '[AI Engine MCP Direct] 📊 Returning ' . count( $tools ) . ' tools' );
+            if ( count( $tools ) > 0 ) {
+              $tool_names = array_column( $tools, 'name' );
+              error_log( '[AI Engine MCP Direct] 🛠️ Tool names: ' . implode( ', ', $tool_names ) );
+            }
+            else {
+              error_log( '[AI Engine MCP Direct] ⚠️ WARNING: No tools returned!' );
+            }
+          }
+
+          $reply = [
+            'jsonrpc' => '2.0',
+            'id' => $id,
+            'result' => [ 'tools' => $tools ],
+          ];
+          break;
+
+        case 'tools/call':
+          $params = $data['params'] ?? [];
+          $tool = $params['name'] ?? '';
+          $arguments = $params['arguments'] ?? [];
+
+          if ( $this->logging ) {
+            error_log( '[AI Engine MCP Direct] 🔧 tools/call - Tool: ' . $tool );
+            error_log( '[AI Engine MCP Direct] 🔧 tools/call - Arguments: ' . wp_json_encode( $arguments ) );
+          }
+
+          try {
+            $reply = $this->execute_tool( $tool, $arguments, $id );
+            if ( $this->logging ) {
+              error_log( '[AI Engine MCP Direct] ✅ tools/call - Success for tool: ' . $tool );
+            }
+          }
+          catch ( Exception $e ) {
+            if ( $this->logging ) {
+              error_log( '[AI Engine MCP Direct] ❌ tools/call - Error: ' . $e->getMessage() );
+            }
+            throw $e;
+          }
+          break;
+
+        case 'notifications/initialized':
+          // This is a notification from the client indicating it has initialized
+          // No response needed for notifications
+          // Client initialized - no need to log
+          return $this->attach_session_header( new WP_REST_Response( null, 204 ), $session_id );
+          break;
+
+        default:
+          // Check if it's a notification (no id)
+          if ( $id === null && strpos( $method, 'notifications/' ) === 0 ) {
+            if ( $this->logging ) {
+              error_log( '[AI Engine MCP] 📨 Notification received: ' . $method );
+            }
+            return $this->attach_session_header( new WP_REST_Response( null, 204 ), $session_id );
+          }
+
+          $reply = [
+            'jsonrpc' => '2.0',
+            'id' => $id,
+            'error' => [ 'code' => -32601, 'message' => "Method not found: {$method}" ]
+          ];
+      }
+
+      // Ensure proper JSON-RPC response
+      $response = new WP_REST_Response( $reply, 200 );
+      $response->set_headers( [ 'Content-Type' => 'application/json' ] );
+      return $this->attach_session_header( $response, $session_id );
+
+    }
+    catch ( Throwable $e ) {
+      if ( $this->logging ) {
+        error_log( '[AI Engine MCP] ❌ Exception in handle_direct_jsonrpc: ' . $e->getMessage() );
+      }
+
+      $error_response = new WP_REST_Response( [
+        'jsonrpc' => '2.0',
+        'id' => $id,
+        'error' => [ 'code' => -32603, 'message' => 'Internal error', 'data' => $e->getMessage() ]
+      ], 200 );
+      $error_response->set_headers( [ 'Content-Type' => 'application/json' ] );
+      return $this->attach_session_header( $error_response, $session_id );
+    }
+  }
+  #endregion
+
+  #region Session helpers
+  private function attach_session_header( WP_REST_Response $response, string $session_id ) {
+    if ( empty( $session_id ) ) {
+      return $response;
+    }
+
+    $response->header( 'Mcp-Session-Id', $session_id );
+
+    if ( $this->logging ) {
+      error_log( '[AI Engine MCP] 🪪 Response session header: ' . $session_id );
+    }
+
+    return $response;
+  }
+  #endregion
+
+  #region Handle Streamable HTTP (Modern MCP transport)
+  /**
+   * Handle Streamable HTTP requests per MCP specification.
+   * This is the modern transport used by Claude Code and other MCP clients.
+   *
+   * - POST: Send JSON-RPC request, receive JSON response (or SSE for streaming)
+   * - GET: Open SSE stream for server-initiated messages
+   * - DELETE: Terminate the session
+   *
+   * @see https://modelcontextprotocol.io/specification/2025-03-26/basic/transports#streamable-http
+   */
+  public function handle_streamable_http( WP_REST_Request $request ) {
+    $method = $request->get_method();
+
+    switch ( $method ) {
+      case 'POST':
+        return $this->handle_streamable_http_post( $request );
+
+      case 'GET':
+        return $this->handle_streamable_http_get( $request );
+
+      case 'DELETE':
+        return $this->handle_streamable_http_delete( $request );
+
+      default:
+        return new WP_REST_Response( [
+          'error' => 'Method not allowed'
+        ], 405 );
+    }
+  }
+
+  /**
+   * Handle POST requests for Streamable HTTP.
+   * This processes JSON-RPC requests and returns JSON responses.
+   */
+  private function handle_streamable_http_post( WP_REST_Request $request ) {
+    $this->release_session_lock();
+    $raw_body = $request->get_body();
+
+    if ( empty( $raw_body ) ) {
+      return new WP_REST_Response( [
+        'jsonrpc' => '2.0',
+        'id' => null,
+        'error' => [ 'code' => -32700, 'message' => 'Parse error: empty body' ]
+      ], 400 );
+    }
+
+    $data = json_decode( $raw_body, true );
+
+    if ( json_last_error() !== JSON_ERROR_NONE ) {
+      return new WP_REST_Response( [
+        'jsonrpc' => '2.0',
+        'id' => null,
+        'error' => [ 'code' => -32700, 'message' => 'Parse error: invalid JSON' ]
+      ], 400 );
+    }
+
+    // Log the request if debugging is enabled
+    if ( $this->logging && isset( $data['method'] ) ) {
+      error_log( '[AI Engine MCP HTTP] ↓ ' . $data['method'] );
+    }
+
+    // Reuse the existing direct JSON-RPC handler
+    return $this->handle_direct_jsonrpc( $request, $data );
+  }
+
+  /**
+   * Handle GET requests for Streamable HTTP.
+   * This opens an SSE stream for server-to-client messages.
+   * Used when the server needs to send notifications or progress updates.
+   */
+  private function handle_streamable_http_get( WP_REST_Request $request ) {
+    // Check Accept header - must accept text/event-stream
+    $accept = $request->get_header( 'accept' );
+    if ( strpos( $accept, 'text/event-stream' ) === false ) {
+      return new WP_REST_Response( [
+        'error' => 'Accept header must include text/event-stream'
+      ], 406 );
+    }
+
+    // Get or create session ID
+    $session_header = $request->get_header( 'mcp-session-id' );
+    $session_id = !empty( $session_header ) ? sanitize_text_field( $session_header ) : wp_generate_uuid4();
+
+    if ( $this->logging ) {
+      error_log( '[AI Engine MCP HTTP] 📡 SSE stream opened for session: ' . substr( $session_id, 0, 8 ) . '...' );
+    }
+
+    // Set up SSE output
+    @ini_set( 'zlib.output_compression', '0' );
+    @ini_set( 'output_buffering', '0' );
+    @ini_set( 'implicit_flush', '1' );
+    if ( function_exists( 'ob_implicit_flush' ) ) {
+      ob_implicit_flush( true );
+    }
+
+    header( 'Content-Type: text/event-stream' );
+    header( 'Cache-Control: no-cache' );
+    header( 'X-Accel-Buffering: no' );
+    header( 'Connection: keep-alive' );
+    header( 'Mcp-Session-Id: ' . $session_id );
+
+    while ( ob_get_level() ) {
+      ob_end_flush();
+    }
+
+    $this->session_id = $session_id;
+    $this->last_action_time = time();
+
+    // Send initial connection event
+    echo "event: open\n";
+    echo 'data: {"session":"' . esc_js( $session_id ) . "\"}\n\n";
+    flush();
+
+    $max_time = $this->logging ? 30 : 60 * 3;
+    /**
+    * How long an idle SSE stream may hold a PHP worker, in seconds.
+    *
+    * Each open stream occupies one worker until this elapses, so a client that opens
+    * streams without ever sending DELETE can pin the whole pool on a small host.
+    * Lower this when that happens; the client simply reconnects.
+    *
+    * Resolved once per stream, not inside the loop below, which spins five times a second.
+    *
+    * @param int $max_time Seconds. 180 normally, 30 when MCP logging is enabled.
+    * @param string $session_id The session this stream belongs to.
+    */
+    $max_time = (int) apply_filters( 'mwai_mcp_stream_max_time', $max_time, $session_id );
+    if ( $max_time < 5 ) {
+      $max_time = 5;
+    }
+
+    // Main SSE loop - listen for server-initiated messages
+    while ( true ) {
+      $idle = ( time() - $this->last_action_time ) >= $max_time;
+
+      if ( connection_aborted() || $idle ) {
+        if ( $this->logging ) {
+          error_log( '[AI Engine MCP HTTP] 🔚 SSE closed (' . ( $idle ? 'idle' : 'abort' ) . ')' );
+        }
+        break;
+      }
+
+      // Check for queued messages
+      foreach ( $this->fetch_messages( $session_id ) as $msg ) {
+        if ( isset( $msg['method'] ) && $msg['method'] === 'mwai/kill' ) {
+          echo "event: close\ndata: {}\n\n";
+          flush();
+          exit;
+        }
+
+        echo "event: message\n";
+        echo 'data: ' . wp_json_encode( $msg, JSON_UNESCAPED_UNICODE ) . "\n\n";
+        flush();
+        $this->last_action_time = time();
+      }
+
+      // Heartbeat every 10 seconds
+      $time_since_last = time() - $this->last_action_time;
+      if ( $time_since_last >= 10 && $time_since_last % 10 === 0 ) {
+        echo ": heartbeat\n\n";
+        flush();
+      }
+
+      usleep( 200000 ); // 200ms
+    }
+
+    exit;
+  }
+
+  /**
+   * Handle DELETE requests for Streamable HTTP.
+   * This terminates the session and cleans up any resources.
+   */
+  private function handle_streamable_http_delete( WP_REST_Request $request ) {
+    $session_header = $request->get_header( 'mcp-session-id' );
+
+    if ( empty( $session_header ) ) {
+      return new WP_REST_Response( [
+        'error' => 'Mcp-Session-Id header required'
+      ], 400 );
+    }
+
+    $session_id = sanitize_text_field( $session_header );
+
+    if ( $this->logging ) {
+      error_log( '[AI Engine MCP HTTP] 🗑️ Session terminated: ' . substr( $session_id, 0, 8 ) . '...' );
+    }
+
+    // Queue kill signal for any active SSE streams
+    $this->store_message( $session_id, [
+      'jsonrpc' => '2.0',
+      'method' => 'mwai/kill'
+    ] );
+
+    // Clean up any remaining transients for this session
+    global $wpdb;
+    $like = $wpdb->esc_like( '_transient_' . "{$this->queue_key}_{$session_id}_" ) . '%';
+    $wpdb->query(
+      $wpdb->prepare(
+        "DELETE FROM {$wpdb->options} WHERE option_name LIKE %s",
+        $like
+      )
+    );
+
+    // Return 204 No Content on successful termination
+    return new WP_REST_Response( null, 204 );
+  }
+  #endregion
+
+  #region Access Control
+  /**
+  * Whether the Access Level setting narrows this request.
+  *
+  * It governs the shared bearer token, which is what its description has always
+  * said: one secret handed to a script, so the owner decides how far it reaches.
+  * An OAuth connection is the opposite case. It belongs to one person who signed
+  * in as themselves, so narrowing them again by a global role meant an
+  * administrator on Claude Desktop silently lost every admin-level tool, with no
+  * reason given and no setting on screen to explain it (the selector only appears
+  * when a bearer token is configured). OAuth users without manage_options are
+  * narrowed instead by limited_session_refusal(), from their own capabilities.
+  *
+  * Both the listing and the execution gate call this. They used to decide it
+  * separately, which is how they drifted apart in the first place.
+  */
+  private function role_filter_applies(): bool {
+    return $this->auth_method !== 'oauth' && $this->mcp_role !== 'admin';
+  }
+
+  // A Read-only grant may only run tools labelled 'read'. mwai_vision is one, but its 'path'
+  // reads any file PHP can read, which is more than "look at the site".
+  private function read_only_refusal( string $tool, string $level, array $args ): ?string {
+    if ( $level !== 'read' ) {
+      return "This connection is read-only, so '{$tool}' is not available. Ask the site owner for full access if you need to make changes.";
+    }
+    if ( $tool === 'mwai_vision' && !empty( $args['path'] ) ) {
+      return 'This connection is read-only and cannot analyze server files; pass an image URL instead.';
+    }
+    return null;
+  }
+
+  /**
+  * Why a limited session may not run this call, or null when it may. Every check asks
+  * WordPress what this user can do, so an Editor reaches exactly what the dashboard
+  * lets them reach: edit_post maps templates and global styles to edit_theme_options,
+  * private posts to the private caps, and so on.
+  */
+  private function limited_session_refusal( string $tool, array $args ): ?string {
+    if ( !in_array( $tool, self::LIMITED_SESSION_TOOLS, true ) ) {
+      return "Access denied: '{$tool}' is only available to administrators.";
+    }
+    $cant = 'Access denied: your WordPress account is not allowed to ';
+    // Read the post ID exactly as the tool will. dispatch() in mcp-core.php fills whichever
+    // of ID, post_id and id is missing from the first one given, and each tool then reads
+    // its own key. A plain fallback chain here let a call pass an editable post as ID while
+    // wp_set_featured_image acted on another one given as post_id.
+    $id_given = null;
+    foreach ( [ 'ID', 'post_id', 'id' ] as $k ) {
+      if ( isset( $args[ $k ] ) && $args[ $k ] !== '' ) {
+        $id_given = $id_given ?? $args[ $k ];
+      }
+    }
+    $id_key = [ 'wp_set_featured_image' => 'post_id', 'mwai_image' => 'postId' ][ $tool ] ?? 'ID';
+    $id_value = ( isset( $args[ $id_key ] ) && $args[ $id_key ] !== '' ) ? $args[ $id_key ] : ( $id_key === 'postId' ? null : $id_given );
+    $post_id = (int) ( $id_value ?? 0 );
+    $fields = $args['fields'] ?? [];
+    if ( is_string( $fields ) ) {
+      $fields = json_decode( $fields, true );
+    }
+    $fields = is_array( $fields ) ? array_merge( $args, $fields ) : $args;
+
+    // Meta keys that tell WordPress where a media file lives on disk. wp-admin never lets
+    // an Editor change them; rewritten, image editing or cleanup tools would later act on
+    // a file outside uploads. Only these are refused: other protected meta (SEO plugins,
+    // page builders) stays writable on posts the user can edit. Compared lowercased, since
+    // MySQL matches meta keys case-insensitively and would update the real row.
+    $meta_keys = [];
+    if ( $tool === 'wp_update_post_meta' ) {
+      $meta = $args['meta'] ?? [];
+      if ( is_string( $meta ) ) {
+        $meta = json_decode( $meta, true );
+      }
+      $meta_keys = is_array( $meta ) ? array_keys( $meta ) : [];
+      if ( isset( $args['key'] ) ) {
+        $meta_keys[] = $args['key'];
+      }
+    }
+    elseif ( in_array( $tool, [ 'wp_create_post', 'wp_update_post' ], true ) ) {
+      // Both tools read meta_input from the top level only (never from fields), and also
+      // take it as a JSON string they decode themselves. Checking a merged copy let a
+      // decoy fields.meta_input hide the real one.
+      $meta_input = $args['meta_input'] ?? null;
+      if ( is_string( $meta_input ) ) {
+        $meta_input = json_decode( $meta_input, true );
+      }
+      $meta_keys = is_array( $meta_input ) ? array_keys( $meta_input ) : [];
+    }
+    $file_keys = [ '_wp_attached_file', '_wp_attachment_metadata', '_wp_attachment_backup_sizes' ];
+    $touched = array_intersect( array_map( function ( $k ) {
+      return strtolower( trim( (string) $k ) );
+    }, $meta_keys ), $file_keys );
+    if ( !empty( $touched ) ) {
+      return $cant . 'change media file references (' . implode( ', ', array_unique( $touched ) ) . ').';
+    }
+
+    switch ( $tool ) {
+      case 'wp_get_post':
+      case 'wp_get_post_snapshot':
+      case 'wp_get_blocks':
+      case 'wp_get_post_meta':
+      case 'wp_get_post_terms':
+        if ( !$post_id || !current_user_can( 'read_post', $post_id ) ) {
+          return $cant . "read post #{$post_id}.";
+        }
+        // read_post lets any logged-in user read a published post, even of a type with
+        // no public view (global styles, navigation menus, a plugin's coupons). The
+        // dashboard only shows those to people who can edit them, so require that here.
+        if ( !is_post_type_viewable( (string) get_post_type( $post_id ) ) && !current_user_can( 'edit_post', $post_id ) ) {
+          return $cant . "read post #{$post_id}.";
+        }
+        break;
+
+      case 'wp_get_posts':
+        $type = get_post_type_object( sanitize_key( $args['post_type'] ?? 'post' ) );
+        if ( !$type ) {
+          return $cant . 'list this type of content.';
+        }
+        // Same rule as reading one post: a type with no public view is listed only for
+        // people who can edit that type.
+        if ( !is_post_type_viewable( $type ) && !current_user_can( $type->cap->edit_posts ) ) {
+          return $cant . 'list this type of content.';
+        }
+        $status = $args['post_status'] ?? 'publish';
+        if ( $status !== 'publish' && !current_user_can( $type->cap->edit_others_posts ) ) {
+          return $cant . 'list unpublished content of other authors.';
+        }
+        break;
+
+      case 'wp_create_post':
+        // The tool reads post_type and post_status from the top level only, so check those:
+        // a decoy "fields" object once passed this check while the real values were written.
+        // sanitize_key() as the tool does, since WordPress lowercases "PUBLISH" to publish.
+        $type = get_post_type_object( sanitize_key( $args['post_type'] ?? 'post' ) );
+        if ( !$type || !current_user_can( $type->cap->create_posts ) ) {
+          return $cant . 'create this type of content.';
+        }
+        if ( in_array( sanitize_key( $args['post_status'] ?? 'draft' ), [ 'publish', 'future', 'private' ], true )
+          && !current_user_can( $type->cap->publish_posts ) ) {
+          return $cant . 'publish this type of content.';
+        }
+        break;
+
+      case 'wp_update_post':
+        if ( !$post_id || !current_user_can( 'edit_post', $post_id ) ) {
+          return $cant . "edit post #{$post_id}.";
+        }
+        if ( isset( $fields['post_type'] ) && sanitize_key( $fields['post_type'] ) !== get_post_type( $post_id ) ) {
+          return $cant . 'change the type of a post.';
+        }
+        // WordPress runs sanitize_key() on the status before saving, so "TRASH" or "PUBLISH"
+        // would slip past an exact comparison and still take effect.
+        $status = sanitize_key( (string) ( $fields['post_status'] ?? '' ) );
+        // The tool routes this status to wp_trash_post(), and deleting stays with
+        // administrators, as the consent screen promises. Restoring from the trash is fine.
+        if ( $status === 'trash' ) {
+          return $cant . 'move posts to the trash. Deleting stays with administrators.';
+        }
+        // schedule_for switches the status to 'future' on its own, so it is publishing too.
+        $publishes = in_array( $status, [ 'publish', 'future', 'private' ], true )
+          || !empty( $args['schedule_for'] );
+        if ( $publishes && !current_user_can( 'publish_post', $post_id ) ) {
+          return $cant . "publish post #{$post_id}.";
+        }
+        // Handing a post to another author needs edit_others_posts, as in wp-admin.
+        if ( isset( $fields['post_author'] )
+          && (int) $fields['post_author'] !== (int) get_post_field( 'post_author', $post_id ) ) {
+          $type = get_post_type_object( (string) get_post_type( $post_id ) );
+          if ( !$type || !current_user_can( $type->cap->edit_others_posts ) ) {
+            return $cant . 'change the author of a post.';
+          }
+        }
+        break;
+
+      case 'wp_alter_post':
+      case 'wp_write_blocks':
+      case 'wp_edit_blocks':
+      case 'wp_insert_block_pattern':
+      case 'wp_update_post_meta':
+      case 'wp_update_media':
+      case 'wp_set_featured_image':
+        if ( !$post_id || !current_user_can( 'edit_post', $post_id ) ) {
+          return $cant . "edit post #{$post_id}.";
+        }
+        break;
+
+      case 'wp_add_post_terms':
+        $taxonomy = get_taxonomy( sanitize_key( $args['taxonomy'] ?? 'category' ) );
+        if ( !$post_id || !current_user_can( 'edit_post', $post_id ) ) {
+          return $cant . "edit post #{$post_id}.";
+        }
+        if ( !$taxonomy || !current_user_can( $taxonomy->cap->assign_terms ) ) {
+          return $cant . 'assign terms of this taxonomy.';
+        }
+        break;
+
+      case 'wp_create_term':
+        $taxonomy = get_taxonomy( sanitize_key( $args['taxonomy'] ?? '' ) );
+        if ( !$taxonomy || !current_user_can( $taxonomy->cap->manage_terms ) ) {
+          return $cant . 'create terms in this taxonomy.';
+        }
+        break;
+
+      case 'wp_update_term':
+        if ( !current_user_can( 'edit_term', (int) ( $args['term_id'] ?? 0 ) ) ) {
+          return $cant . 'edit this term.';
+        }
+        break;
+
+      case 'wp_get_comments':
+      case 'wp_create_comment':
+        if ( !current_user_can( 'moderate_comments' ) ) {
+          return $cant . 'manage comments.';
+        }
+        break;
+
+      case 'wp_update_comment':
+        if ( !current_user_can( 'edit_comment', (int) ( $args['comment_ID'] ?? 0 ) ) ) {
+          return $cant . 'edit this comment.';
+        }
+        // The tool passes any field through to wp_update_comment(). wp-admin never lets
+        // anyone move a comment to another post or change which user wrote it, so a
+        // limited session keeps to what the comment edit screen offers.
+        $comment_fields = is_array( $args['fields'] ?? null ) ? array_keys( $args['fields'] ) : [];
+        $editable = [ 'comment_content', 'comment_approved', 'comment_author', 'comment_author_email', 'comment_author_url' ];
+        $blocked = array_diff( $comment_fields, $editable );
+        if ( !empty( $blocked ) ) {
+          return $cant . 'change these comment fields: ' . implode( ', ', $blocked ) . '.';
+        }
+        break;
+
+      case 'wp_upload_media':
+      case 'wp_upload_request':
+        if ( !current_user_can( 'upload_files' ) ) {
+          return $cant . 'upload files.';
+        }
+        break;
+
+      case 'mwai_image':
+        if ( !current_user_can( 'upload_files' ) ) {
+          return $cant . 'upload files.';
+        }
+        if ( $post_id && !current_user_can( 'edit_post', $post_id ) ) {
+          return $cant . "edit post #{$post_id}.";
+        }
+        break;
+
+      case 'mwai_vision':
+        // A local path would let the session read any file PHP can read.
+        if ( !empty( $args['path'] ) ) {
+          return $cant . 'analyze server files; pass an image URL instead.';
+        }
+        break;
+    }
+    return null;
+  }
+
+  private function role_has_access( string $toolLevel ): bool {
+    if ( $this->mcp_role === 'admin' ) {
+      return true;
+    }
+    if ( $this->mcp_role === 'readwrite' ) {
+      return in_array( $toolLevel, [ 'read', 'write' ] );
+    }
+    if ( $this->mcp_role === 'readonly' ) {
+      return $toolLevel === 'read';
+    }
+    return false;
+  }
+  #endregion
+
+  #region Tools Definitions
+  public function is_write_call( string $tool, $args = null ): bool {
+    if ( empty( $this->tool_access_levels ) ) {
+      $this->get_tools_list();
+    }
+    if ( empty( $this->tool_writes[ $tool ] ) ) {
+      return false;
+    }
+    if ( !empty( $this->tool_mixed[ $tool ] ) ) {
+      // Without the arguments (a backfill from logs), an "action" tool cannot be told apart.
+      $action = is_array( $args ) ? (string) ( $args['action'] ?? '' ) : '';
+      return $action !== '' && (bool) preg_match( self::WRITE_VERBS, $action );
+    }
+    // An ability not marked read-only can change the site, whatever its name: SiteOrigin's
+    // "layout-update" declared no hints and slipped past History, undo and approvals.
+    if ( !empty( $this->tool_abilities[ $tool ] ) ) {
+      return true;
+    }
+    return ( $this->tool_levels_raw[ $tool ] ?? null ) === 'write' || (bool) preg_match( self::WRITE_VERBS, $tool );
+  }
+
+  private function get_tools_list() {
+    $base_tools = [
+      [
+        'name' => 'mcp_ping',
+        'description' => 'Simple connectivity check. Returns the current GMT time and the WordPress site name. Whenever a tool call fails (error or timeout), immediately invoke mcp_ping to verify the server; if mcp_ping itself does not respond, assume the server is temporarily unreachable and pause additional tool calls.',
+        'inputSchema' => [
+          'type' => 'object',
+          'properties' => (object) [],
+          'required' => []
+        ],
+        'annotations' => [
+          'readOnlyHint' => true,
+          'destructiveHint' => false,
+          'openWorldHint' => false,
+        ],
+        'accessLevel' => 'read',
+      ],
+      [
+        'name' => 'mcp_list_changes',
+        'description' => 'List the recent changes made on this site through MCP (by any assistant, newest first), with their ID, what they changed, and whether they can be undone. Use it before mcp_undo_change when the user asks to revert something that was not your last change.',
+        'inputSchema' => [
+          'type' => 'object',
+          'properties' => [
+            'limit' => [ 'type' => 'integer', 'description' => 'How many changes to list (default 10, max 50).' ],
+          ],
+          'required' => [],
+        ],
+        'annotations' => [ 'readOnlyHint' => true, 'destructiveHint' => false, 'openWorldHint' => false ],
+        'accessLevel' => 'read',
+      ],
+      [
+        'name' => 'mcp_undo_change',
+        'description' => 'Undo a change made through MCP: puts back what it replaced (post fields, meta, terms, options, plugins...). Pass "last" to undo your own latest change, or an ID from mcp_list_changes. Refused when the item was edited again since, so newer work is never erased; tell the user to check it in WordPress instead. An undo can itself be undone.',
+        'inputSchema' => [
+          'type' => 'object',
+          'properties' => [
+            'id' => [ 'type' => 'string', 'description' => 'The change ID (a number from mcp_list_changes), or "last".' ],
+          ],
+          'required' => [ 'id' ],
+        ],
+        'annotations' => [ 'readOnlyHint' => false, 'destructiveHint' => false, 'openWorldHint' => false ],
+        'accessLevel' => 'write',
+      ],
+    ];
+
+    if ( $this->logging ) {
+      error_log( '[AI Engine MCP] 🔧 get_tools_list() - Starting with ' . count( $base_tools ) . ' base tools' );
+    }
+
+    $filtered_tools = apply_filters( 'mwai_mcp_tools', $base_tools );
+
+    if ( $this->logging ) {
+      error_log( '[AI Engine MCP] 🔧 get_tools_list() - After filters: ' . count( $filtered_tools ) . ' tools' );
+    }
+
+    // Build access level map for defense-in-depth checks in execute_tool()
+    foreach ( $filtered_tools as $tool ) {
+      if ( isset( $tool['name'] ) ) {
+        $this->tool_access_levels[ $tool['name'] ] = $tool['accessLevel'] ?? 'admin';
+        $this->tool_writes[ $tool['name'] ] = isset( $tool['accessLevel'] ) && $tool['accessLevel'] !== 'read'
+          && empty( ( (array) ( $tool['annotations'] ?? [] ) )['readOnlyHint'] );
+        $this->tool_levels_raw[ $tool['name'] ] = $tool['accessLevel'] ?? null;
+        $this->tool_abilities[ $tool['name'] ] = ( $tool['source'] ?? '' ) === 'ability';
+        // Schemas without arguments use an empty object for properties (JSON "{}"), not an array.
+        $props = $tool['inputSchema']['properties'] ?? [];
+        $this->tool_mixed[ $tool['name'] ] = is_array( $props ) ? isset( $props['action'] ) : isset( $props->action );
+      }
+    }
+
+    // Filter tools by access level based on the MCP role.
+    //
+    // This applies to the shared bearer token only, which is what the setting has
+    // always described: one secret handed to a script, so the site owner decides
+    // how far it reaches. An OAuth connection is the opposite case. It belongs to
+    // one person, they signed in as themselves, and authorize_token() already
+    // refuses anyone without manage_options, so filtering them again by a global
+    // role meant an administrator on Claude Desktop silently lost every
+    // admin-level tool with no visible reason and no setting on screen to explain
+    // it (the selector only appears when a bearer token is configured).
+    if ( $this->role_filter_applies() ) {
+      $filtered_tools = array_filter( $filtered_tools, function ( $tool ) {
+        $level = $tool['accessLevel'] ?? 'admin';
+        return $this->role_has_access( $level );
+      } );
+    }
+    if ( $this->limited_session ) {
+      $filtered_tools = array_filter( $filtered_tools, function ( $tool ) {
+        return in_array( $tool['name'] ?? '', self::LIMITED_SESSION_TOOLS, true );
+      } );
+    }
+    // A tool without a level counts as 'admin', so an unlabelled write never slips through.
+    if ( $this->read_only_grant ) {
+      $filtered_tools = array_filter( $filtered_tools, function ( $tool ) {
+        return ( $tool['accessLevel'] ?? 'admin' ) === 'read';
+      } );
+    }
+
+    $normalized_tools = [];
+    foreach ( $filtered_tools as $tool_index => $tool_definition ) {
+      $normalized = $this->normalize_tool_definition( $tool_definition, $tool_index );
+      if ( $normalized ) {
+        $normalized_tools[] = $normalized;
+      }
+    }
+
+    if ( $this->logging ) {
+      error_log( '[AI Engine MCP] 🔧 get_tools_list() - Normalized tools: ' . count( $normalized_tools ) );
+    }
+
+    return $normalized_tools;
+  }
+  #endregion
+
+  #region Resources Definitions
+  private function get_resources_list() {
+    return [];
+  }
+  #endregion
+
+  #region Prompts Definitions
+  private function get_prompts_list() {
+    return [];
+  }
+  #endregion
+
+  #region Tool Normalization Helpers
+  private function normalize_tool_definition( $tool, $index ) {
+    // NOTE: tool-registration warnings below are always emitted (no $this->logging
+    // gate). Each fires only when a tool is silently auto-fixed or auto-skipped at
+    // registration — exactly the case where the author needs to know. They're rare
+    // in normal operation and the only reliable diagnostic when something is off.
+    if ( !is_array( $tool ) ) {
+      error_log( '[AI Engine MCP] ⚠️ Tool definition at index ' . $index . ' skipped (expected array).' );
+      return null;
+    }
+
+    $name = isset( $tool['name'] ) ? trim( (string) $tool['name'] ) : '';
+    if ( $name === '' ) {
+      error_log( '[AI Engine MCP] ⚠️ Tool skipped due to missing name at index ' . $index );
+      return null;
+    }
+
+    $normalized_schema = $this->normalize_input_schema( $tool['inputSchema'] ?? null, $name );
+    if ( !$normalized_schema ) {
+      error_log( '[AI Engine MCP] ⚠️ Tool "' . $name . '" skipped due to invalid input schema.' );
+      return null;
+    }
+
+    $normalized = [
+      'name' => $name,
+      'inputSchema' => $normalized_schema,
+    ];
+
+    if ( isset( $tool['description'] ) && $tool['description'] !== '' ) {
+      // Kept as is: models read it as text. Stripping tags erased our own examples, such as
+      // "<!-- wp:paragraph -->" in wp_alter_post and the "<upload_url>" placeholder of wp_upload_request.
+      $normalized['description'] = trim( (string) $tool['description'] );
+    }
+
+    if ( isset( $tool['annotations'] ) && is_array( $tool['annotations'] ) ) {
+      $annotations = $this->normalize_annotations( $tool['annotations'], $name );
+      if ( !empty( $annotations ) ) {
+        $normalized['annotations'] = $annotations;
+      }
+    }
+
+    // Claude and ChatGPT ask the user before a destructive tool runs. The per-file name heuristics
+    // only flagged wp_delete_*, so options, installs, file edits and SQL writes ran unasked.
+    if ( in_array( $name, self::RISKY_TOOLS, true ) ) {
+      $normalized['annotations'] = array_merge( $normalized['annotations'] ?? [], [
+        'readOnlyHint' => false,
+        'destructiveHint' => true,
+      ] );
+    }
+
+    return $normalized;
+  }
+
+  private function normalize_input_schema( $schema, string $tool_name ) {
+    if ( !is_array( $schema ) ) {
+      return null;
+    }
+
+    $type = isset( $schema['type'] ) ? (string) $schema['type'] : 'object';
+    if ( $type !== 'object' ) {
+      error_log( '[AI Engine MCP] ⚠️ Tool "' . $tool_name . '" has unsupported schema type: ' . $type );
+      return null;
+    }
+
+    $properties = [];
+    if ( isset( $schema['properties'] ) && ( is_array( $schema['properties'] ) || is_object( $schema['properties'] ) ) ) {
+      foreach ( (array) $schema['properties'] as $prop_name => $definition ) {
+        if ( !is_array( $definition ) ) {
+          $definition = [];
+        }
+
+        if ( isset( $definition['type'] ) ) {
+          // Validate type definition
+          if ( is_array( $definition['type'] ) ) {
+            // Array of types (union types) - validate they're compatible with MCP clients
+            $type_array = array_map( 'strval', $definition['type'] );
+
+            // Check for complex types that need additional schema details
+            $complex_types = array_intersect( $type_array, [ 'object', 'array' ] );
+            if ( !empty( $complex_types ) ) {
+              error_log(
+                '[AI Engine MCP] ⚠️ Tool "' . $tool_name . '" property "' . $prop_name .
+                '" has problematic union type with complex types: [' . implode( ', ', $type_array ) .
+                ']. This breaks ChatGPT. Auto-fixing by removing type constraint.'
+              );
+              // Auto-fix: Remove the type constraint to accept any value
+              unset( $definition['type'] );
+              // Keep description if present, or add one
+              if ( !isset( $definition['description'] ) ) {
+                $definition['description'] = 'Value can be of any type';
+              }
+            }
+            else {
+              $definition['type'] = $type_array;
+            }
+          }
+          else {
+            $definition['type'] = (string) $definition['type'];
+          }
+        }
+
+        $properties[ $prop_name ] = $definition;
+      }
+    }
+
+    $required = [];
+    if ( isset( $schema['required'] ) && is_array( $schema['required'] ) ) {
+      foreach ( $schema['required'] as $field ) {
+        $field_name = trim( (string) $field );
+        if ( $field_name !== '' ) {
+          $required[] = $field_name;
+        }
+      }
+      $required = array_values( array_unique( $required ) );
+    }
+
+    $normalized = [
+      'type' => 'object',
+      'properties' => empty( $properties ) ? new stdClass() : $properties,
+    ];
+
+    if ( !empty( $required ) ) {
+      $normalized['required'] = $required;
+    }
+
+    if ( array_key_exists( 'additionalProperties', $schema ) ) {
+      $normalized['additionalProperties'] = (bool) $schema['additionalProperties'];
+    }
+
+    return $normalized;
+  }
+
+  /**
+   * What a freshly connected assistant should know and do first. Without it, people connected,
+   * faced an empty chat and left (Torii, 2026-10: 8 of 16 removals had never made a call).
+   * Mirrors Torii's onboarding (torii-connect src/onboarding.ts), minus its own tools.
+   */
+  private function instructions(): string {
+    $tagline = get_bloginfo( 'description' );
+    $parts = [
+      sprintf(
+        'These tools work on the WordPress site "%s" (%s)%s through AI Engine, with the user\'s own WordPress permissions. Site language: %s.',
+        wp_strip_all_tags( get_bloginfo( 'name' ) ),
+        home_url(),
+        $tagline ? ', "' . wp_strip_all_tags( $tagline ) . '",' : '',
+        get_locale()
+      ),
+      'If the user has not said what they want, look at their latest posts with wp_get_posts and offer three concrete ideas based on their site: for example a short tour of their latest posts, a new draft in their voice, or a quick content audit (posts without a category, featured image or excerpt).',
+      'New posts and pages are drafts unless the user asks to publish; say so when you create one, and give its edit link.',
+      'Deleting moves items to the trash unless the user explicitly asks for a permanent delete.',
+      'Every change can be undone: mcp_list_changes shows them, mcp_undo_change reverts one.',
+    ];
+    $parts = array_merge( $parts, Meow_MWAI_Labs_MCP_Approvals::instructions() );
+    return (string) apply_filters( 'mwai_mcp_instructions', implode( ' ', $parts ) );
+  }
+
+  /** Starter prompts, shown by Claude in its + menu. Same names and words as Torii's, so the menu matches. */
+  private function prompts(): array {
+    return [
+      [
+        'name' => 'tour_my_site',
+        'title' => 'Tour my site',
+        'description' => 'A short tour of your WordPress site: what it is about, the latest posts, and three ideas to improve it.',
+        'text' => fn () => 'Give me a short tour of my WordPress site: look at my five most recent posts with wp_get_posts. Tell me in a few lines what the site is about and how recently it was updated, then suggest three concrete things we could do together right now.',
+      ],
+      [
+        'name' => 'write_a_draft',
+        'title' => 'Write a draft post',
+        'description' => 'Write a new draft post on your site, in the voice of your existing posts.',
+        'arguments' => [ [ 'name' => 'topic', 'description' => 'What the post is about', 'required' => true ] ],
+        'text' => fn ( $a ) => 'Write a draft post on my WordPress site about: ' . ( !empty( $a['topic'] ) ? $a['topic'] : 'a topic you suggest from my recent posts' ) . '. First read two or three of my recent posts to match their tone and length. Use real editor blocks (headings and paragraphs), pick an existing category if one fits, keep it as a draft, and give me the edit link.',
+      ],
+      [
+        'name' => 'audit_my_content',
+        'title' => 'Audit my content',
+        'description' => 'Find what needs attention: posts without a category, featured image or excerpt, old drafts, pending comments.',
+        'text' => fn () => 'Audit the content of my WordPress site: find published posts without a category, a featured image or an excerpt, drafts older than three months, and comments waiting for moderation. Give me a short prioritized list, then offer to fix the easy ones (ask before changing anything).',
+      ],
+      [
+        'name' => 'improve_a_post',
+        'title' => 'Improve a post',
+        'description' => 'Review one of your posts and suggest improvements, then apply the ones you approve.',
+        'arguments' => [ [ 'name' => 'post', 'description' => 'The title (or ID) of the post', 'required' => true ] ],
+        'text' => fn ( $a ) => 'Find my post "' . ( !empty( $a['post'] ) ? $a['post'] : 'my most recent post' ) . '" on my WordPress site and review it: clarity, structure, title, excerpt and categories. Suggest specific improvements, and apply only the ones I approve.',
+      ],
+    ];
+  }
+
+  private function normalize_annotations( array $annotations, string $tool_name ): array {
+    $allowed_keys = [ 'title', 'readOnlyHint', 'destructiveHint', 'idempotentHint', 'openWorldHint' ];
+    $normalized = [];
+
+    foreach ( $annotations as $key => $value ) {
+      if ( !in_array( $key, $allowed_keys, true ) ) {
+        continue;
+      }
+
+      if ( in_array( $key, [ 'readOnlyHint', 'destructiveHint', 'idempotentHint', 'openWorldHint' ], true ) ) {
+        $normalized[ $key ] = (bool) $value;
+      }
+      elseif ( $key === 'title' ) {
+        $normalized['title'] = wp_strip_all_tags( (string) $value );
+      }
+    }
+
+    if ( empty( $normalized ) && $this->logging && !empty( $annotations ) ) {
+      error_log( '[AI Engine MCP] 🔎 Tool "' . $tool_name . '" included unsupported annotation keys.' );
+    }
+
+    return $normalized;
+  }
+  #endregion
+
+  #region Tools Call (execute_tool)
+
+  // Armed while a tool runs, so the shutdown net below can answer for it.
+  private static $currentToolCall = null;
+  private static $shutdownNetRegistered = false;
+  // Emergency memory reserve, released by the net so it can run even after an
+  // out-of-memory fatal on hosts where ini_set is disabled.
+  private static $memoryReserve = null;
+
+  /**
+   * A tool callback that dies hard (out of memory, fatal error) would end the
+   * request as a raw 500 with an empty body, and MCP clients then treat the
+   * WHOLE server as unreachable (Anthropic aborts the conversation with
+   * "Connection error while communicating with MCP server"). This shutdown
+   * net answers with a valid JSON-RPC tool error instead, so only the tool
+   * fails and the client/model can react to it.
+   */
+  private function arm_fatal_net( $tool, $id ) {
+    self::$currentToolCall = [ 'tool' => $tool, 'id' => $id ];
+    if ( self::$memoryReserve === null ) {
+      self::$memoryReserve = str_repeat( 'x', 2 * 1024 * 1024 );
+    }
+    if ( self::$shutdownNetRegistered ) {
+      return;
+    }
+    self::$shutdownNetRegistered = true;
+    // WordPress's own fatal handler runs first (registered at bootstrap) and
+    // exits after printing its "critical error" 500, which would keep our net
+    // from ever running. WP_SANDBOX_SCRAPING is core's shutdown-time escape
+    // hatch for "the request handles fatals itself" (the enabled filter is
+    // only consulted at bootstrap, so it cannot be used here).
+    if ( !defined( 'WP_SANDBOX_SCRAPING' ) ) {
+      define( 'WP_SANDBOX_SCRAPING', true );
+    }
+    register_shutdown_function( function () {
+      $ctx = self::$currentToolCall;
+      if ( empty( $ctx ) ) {
+        return;
+      }
+      $err = error_get_last();
+      if ( !$err || !in_array( $err['type'], [ E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR ], true ) ) {
+        return;
+      }
+      // An OOM can leave ZERO headroom, killing this emitter itself. Free the
+      // reserve first (works everywhere), then lift the limit where allowed
+      // (the request is over anyway).
+      self::$memoryReserve = null;
+      @ini_set( 'memory_limit', '-1' );
+      // Discard any partial/buffered output so the JSON is the only body.
+      while ( ob_get_level() > 0 ) {
+        @ob_end_clean();
+      }
+      if ( !headers_sent() ) {
+        http_response_code( 200 );
+        header( 'Content-Type: application/json' );
+      }
+      $msg = 'The tool "' . $ctx['tool'] . '" crashed on this site (' .
+        substr( $err['message'], 0, 300 ) . '). The other tools should still work.';
+      echo '{"jsonrpc":"2.0","id":' . json_encode( $ctx['id'] ) .
+        ',"result":{"content":[{"type":"text","text":' . json_encode( $msg ) . '}],"isError":true}}';
+    } );
+  }
+
+  private function execute_tool( $tool, $args, $id ) {
+    $start = microtime( true );
+    $response = null;
+    $status = 'error';
+    $error_msg = null;
+    $tool_level = null;
+    $journal = false;
+    $change_ids = [];
+    $this->arm_fatal_net( $tool, $id );
+    try {
+      // Ensure tool access levels are populated (each HTTP request starts fresh)
+      if ( empty( $this->tool_access_levels ) ) {
+        $this->get_tools_list();
+      }
+
+      // Defense in depth: verify tool access even if it wasn't filtered from the listing
+      $tool_level = $this->tool_access_levels[ $tool ] ?? 'admin';
+      if ( $this->role_filter_applies() && !$this->role_has_access( $tool_level ) ) {
+        // 'denied', not 'error': MCP Logs shows a refused call apart from a failing tool.
+        $status = 'denied';
+        $error_msg = "Access denied: tool '{$tool}' requires '{$tool_level}' access.";
+        $response = $this->rpc_error( $id, -32600, $error_msg );
+        return $response;
+      }
+      if ( $this->read_only_grant ) {
+        $refusal = $this->read_only_refusal( (string) $tool, $tool_level, is_array( $args ) ? $args : [] );
+        if ( $refusal !== null ) {
+          $status = 'denied';
+          $error_msg = $refusal;
+          $response = $this->rpc_error( $id, -32600, $error_msg );
+          return $response;
+        }
+      }
+      if ( $this->limited_session ) {
+        $refusal = $this->limited_session_refusal( (string) $tool, is_array( $args ) ? $args : [] );
+        if ( $refusal !== null ) {
+          $status = 'denied';
+          $error_msg = $refusal;
+          $response = $this->rpc_error( $id, -32600, $error_msg );
+          return $response;
+        }
+      }
+
+      // Handle built-in tools first
+      if ( $tool === 'mcp_ping' ) {
+        if ( $this->logging ) {
+          $this->log( '🛠️ Tool: mcp_ping' );
+        }
+        $ping_data = [
+          'time' => gmdate( 'Y-m-d H:i:s' ),
+          'name' => get_bloginfo( 'name' ),
+        ];
+        $response = [
+          'jsonrpc' => '2.0',
+          'id' => $id,
+          'result' => [
+            'content' => [
+              [
+                'type' => 'text',
+                'text' => 'Ping successful: ' . wp_json_encode( $ping_data, JSON_PRETTY_PRINT ),
+              ],
+            ],
+            'data' => $ping_data,
+          ],
+        ];
+        $status = 'success';
+        return $response;
+      }
+
+      if ( $tool === Meow_MWAI_Labs_MCP_Undo::UNDO_TOOL && is_array( $args ) && Meow_MWAI_Labs_MCP_Approvals::drafts_only() ) {
+        $refusal = Meow_MWAI_Labs_MCP_Approvals::drafts_refusal( (string) $tool, $args );
+        if ( $refusal !== null ) {
+          $status = 'denied';
+          $error_msg = $refusal;
+          $response = [ 'jsonrpc' => '2.0', 'id' => $id, 'result' => $this->format_tool_result( $refusal ) + [ 'isError' => true ] ];
+          return $response;
+        }
+      }
+      if ( $tool === 'mcp_list_changes' || $tool === Meow_MWAI_Labs_MCP_Undo::UNDO_TOOL ) {
+        $result = $tool === 'mcp_list_changes' ? $this->list_changes( (array) $args ) : $this->undo_change( (array) $args );
+        $change_ids = $result['changeIds'] ?? [];
+        $response = [ 'jsonrpc' => '2.0', 'id' => $id, 'result' => $this->format_tool_result( $result['text'] ) ];
+        if ( !empty( $result['error'] ) ) {
+          $response['result']['isError'] = true;
+          $error_msg = $result['text'];
+        }
+        $status = empty( $result['error'] ) ? 'success' : 'error';
+        return $response;
+      }
+
+      // Drafts only, then approvals (labs/mcp-approvals.php), for writes only.
+      if ( is_array( $args ) && $this->is_write_call( (string) $tool, $args ) ) {
+        if ( Meow_MWAI_Labs_MCP_Approvals::drafts_only() ) {
+          $refusal = Meow_MWAI_Labs_MCP_Approvals::drafts_refusal( (string) $tool, $args );
+          if ( $refusal !== null ) {
+            $status = 'denied';
+            $error_msg = $refusal;
+            $response = [ 'jsonrpc' => '2.0', 'id' => $id, 'result' => $this->format_tool_result( $refusal ) + [ 'isError' => true ] ];
+            return $response;
+          }
+        }
+        if ( Meow_MWAI_Labs_MCP_Approvals::needs_approval( (string) $tool, $args ) ) {
+          $waiting = Meow_MWAI_Labs_MCP_Approvals::gate( (string) $tool, $args, $this->change_context()['client'] );
+          if ( $waiting !== null ) {
+            $status = Meow_MWAI_Labs_MCP_Approvals::STATUS;
+            $error_msg = $waiting;
+            $response = [ 'jsonrpc' => '2.0', 'id' => $id, 'result' => $this->format_tool_result( $waiting ) + [ 'isError' => true ] ];
+            return $response;
+          }
+        }
+      }
+
+      // Journal what a write is about to replace, so it can be undone (labs/mcp-undo.php).
+      if ( is_array( $args ) && $this->is_write_call( (string) $tool, $args ) ) {
+        $journal = true;
+        Meow_MWAI_Labs_MCP_Undo::begin( (string) $tool, $args );
+      }
+
+      // Let other modules handle their tools
+      if ( $this->logging ) {
+        // Log tool calls with more context
+        $args_preview = '';
+        if ( !empty( $args ) ) {
+          // Show key args for common tools
+          if ( isset( $args['ID'] ) ) {
+            $args_preview = ' (ID: ' . $args['ID'] . ')';
+          }
+          elseif ( isset( $args['query'] ) ) {
+            $args_preview = ' (query: "' . substr( $args['query'], 0, 30 ) . '...")';
+          }
+          elseif ( isset( $args['message'] ) ) {
+            $args_preview = ' (message: "' . substr( $args['message'], 0, 30 ) . '...")';
+          }
+        }
+        // Log to both error log and UI
+        error_log( '[AI Engine MCP] 🛠️ ' . $tool . $args_preview );
+        $this->log( '🛠️ Tool: ' . $tool . $args_preview );
+      }
+      $filtered = apply_filters( 'mwai_mcp_callback', null, $tool, $args, $id, $this );
+
+      if ( $filtered !== null ) {
+        // Check if it's already a full JSON-RPC response (backward compatibility)
+        if ( is_array( $filtered ) && isset( $filtered['jsonrpc'] ) && isset( $filtered['id'] ) ) {
+          $response = $filtered;
+          $status = isset( $filtered['error'] ) ? 'error' : 'success';
+          if ( $status === 'error' ) {
+            $error_msg = $filtered['error']['message'] ?? null;
+            // Tools report their own failures ("Post not found", a missing ID) as JSON-RPC
+            // errors. Returned as is, clients show a broken tool and the model never reads
+            // why, so they get the same isError result as a tool that throws.
+            $response = [
+              'jsonrpc' => '2.0',
+              'id' => $id,
+              'result' => [
+                'content' => [
+                  [
+                    'type' => 'text',
+                    'text' => 'The tool "' . $tool . '" failed: ' . ( $error_msg ?? 'Unknown error.' ),
+                  ],
+                ],
+                'isError' => true,
+              ],
+            ];
+          }
+          return $response;
+        }
+
+        // Otherwise, wrap the result in proper JSON-RPC format
+        $response = [
+          'jsonrpc' => '2.0',
+          'id' => $id,
+          'result' => $this->format_tool_result( $filtered ),
+        ];
+        $status = 'success';
+        return $response;
+      }
+
+      throw new Exception( "Unknown tool: {$tool}" );
+    }
+    catch ( Throwable $e ) {
+      // A tool refusing the call (the user lacks a capability) throws with
+      // DENIED_CODE, so MCP Logs shows it apart from a failing tool.
+      if ( $e->getCode() === self::DENIED_CODE ) {
+        $status = 'denied';
+      }
+      // A failing tool is reported as a tool-level error (isError result),
+      // NOT a JSON-RPC protocol error: clients treat protocol errors as a
+      // broken server, while an isError result lets the model read the
+      // message and adapt. Throwable also catches TypeError & friends.
+      $error_msg = $e->getMessage();
+      $response = [
+        'jsonrpc' => '2.0',
+        'id' => $id,
+        'result' => [
+          'content' => [
+            [
+              'type' => 'text',
+              'text' => 'The tool "' . $tool . '" failed: ' . $error_msg,
+            ],
+          ],
+          'isError' => true,
+        ],
+      ];
+      return $response;
+    }
+    finally {
+      self::$currentToolCall = null;
+      if ( $journal ) {
+        $change_id = Meow_MWAI_Labs_MCP_Undo::finish( $status === 'success', $this->change_context() );
+        $change_ids = $change_id ? [ $change_id ] : [];
+      }
+      $duration_ms = (int) round( ( microtime( true ) - $start ) * 1000 );
+      // Fire the action even on access denials and errors so admins can see
+      // attempted-but-blocked tool calls in MCP Logs.
+      do_action( 'mwai_mcp_tool_called', [
+        'tool' => $tool,
+        'args' => $args,
+        'result' => $response,
+        'status' => $status,
+        'error_msg' => $error_msg,
+        'duration_ms' => $duration_ms,
+        'client_id' => $this->auth_client_id,
+        'client_name' => $this->auth_client_name,
+        'auth_method' => $this->auth_method,
+        'request_id' => $id,
+        'user_id' => get_current_user_id(),
+        'access_level' => $tool_level,
+        'writes' => $this->is_write_call( (string) $tool, $args ),
+        'change_ids' => $change_ids,
+      ] );
+      if ( $status === 'success' && $tool !== 'mcp_ping' ) {
+        $this->bring_review_notice_forward();
+        $this->remember_mcp_use();
+      }
+    }
+  }
+
+  // Who made a change, as the MCP tab names them.
+  private function change_context(): array {
+    return [
+      'user_id' => get_current_user_id(),
+      'client' => Meow_MWAI_Labs_MCP_Usage::client_of( [ 'client_name' => $this->auth_client_name, 'auth_method' => $this->auth_method ] ),
+    ];
+  }
+
+  // An editor (limited session) only sees and undoes their own changes; Undo checks capabilities too.
+  private function list_changes( array $args ): array {
+    $rows = Meow_MWAI_Labs_MCP_Undo::changes( [
+      'limit' => max( 1, min( 50, (int) ( $args['limit'] ?? 10 ) ) ),
+      'user_id' => $this->limited_session ? get_current_user_id() : 0,
+    ] );
+    if ( !$rows ) {
+      return [ 'text' => 'No changes were made through MCP in the last ' . Meow_MWAI_Labs_MCP_Undo::KEEP_DAYS . ' days.' ];
+    }
+    $states = [ 'undoable' => 'can be undone', 'changed' => 'edited again since, cannot be undone', 'undone' => 'already undone', 'none' => 'cannot be undone' ];
+    $lines = [];
+    foreach ( $rows as $row ) {
+      $line = sprintf(
+        '#%d · %s · %s · %s%s · %s',
+        $row['id'],
+        gmdate( 'Y-m-d H:i', $row['time'] ) . ' UTC',
+        $row['client'] ?: 'unknown',
+        $row['tool'],
+        $row['title'] !== '' ? ' on "' . $row['title'] . '"' : '',
+        $states[ $row['status'] ] ?? $row['status']
+      );
+      if ( $row['undoOf'] ) {
+        $line .= ' (undo of #' . $row['undoOf'] . ')';
+      }
+      if ( $row['status'] === 'none' && $row['note'] !== '' ) {
+        $line .= ': ' . $row['note'];
+      }
+      $lines[] = $line;
+    }
+    return [ 'text' => implode( "\n", $lines ) ];
+  }
+
+  private function undo_change( array $args ): array {
+    $id = $args['id'] ?? '';
+    if ( is_string( $id ) && strtolower( trim( $id ) ) === 'last' ) {
+      $id = 0;
+      $context = $this->change_context();
+      foreach ( Meow_MWAI_Labs_MCP_Undo::changes( [ 'limit' => 50, 'user_id' => get_current_user_id(), 'client' => $context['client'] ] ) as $row ) {
+        if ( $row['tool'] !== Meow_MWAI_Labs_MCP_Undo::UNDO_TOOL && $row['status'] !== 'undone' ) {
+          $id = $row['id'];
+          break;
+        }
+      }
+      if ( !$id ) {
+        return [ 'error' => true, 'text' => 'You have no change left to undo. Use mcp_list_changes to see the recent ones.' ];
+      }
+    }
+    $id = (int) $id;
+    if ( $id <= 0 ) {
+      return [ 'error' => true, 'text' => 'Pass a change ID from mcp_list_changes, or "last".' ];
+    }
+    $row = Meow_MWAI_Labs_MCP_Undo::get( $id );
+    if ( $row && $this->limited_session && (int) $row['user_id'] !== get_current_user_id() ) {
+      return [ 'error' => true, 'text' => 'You can only undo your own changes.' ];
+    }
+    $result = Meow_MWAI_Labs_MCP_Undo::undo( [ $id ], false, $this->change_context() );
+    if ( empty( $result['success'] ) ) {
+      return [ 'error' => true, 'text' => $result['message'] ];
+    }
+    return [ 'text' => $result['message'] . ' (change #' . $id . ')', 'changeIds' => $result['changeIds'] ];
+  }
+
+  // A real tool call is the moment MCP has proven itself, so the review notice
+  // (common/ratings.php) shows two days later instead of weeks. A dismissed or
+  // completed notice is dated years ahead and is left alone.
+  private function bring_review_notice_forward() {
+    $date = (int) get_option( 'mwai_rating_date' );
+    $soon = time() + 2 * DAY_IN_SECONDS;
+    if ( empty( $date ) || ( $date > $soon && $date < time() + YEAR_IN_SECONDS ) ) {
+      update_option( 'mwai_rating_date', $soon, false );
+    }
+  }
+  // The day MCP last did real work. Pro's update check reports whether that was within 30 days,
+  // the only way we can tell how many sites actually use MCP. Written once a day at most.
+  private function remember_mcp_use() {
+    $last = (int) get_option( 'mwai_mcp_last_used', 0 );
+    if ( time() - $last > DAY_IN_SECONDS ) {
+      update_option( 'mwai_mcp_last_used', time(), false );
+    }
+  }
+  #endregion
+
+  #region Handle /upload (one-time file upload via token)
+  public function handle_upload( WP_REST_Request $request ) {
+    $token = $request->get_param( 'token' );
+    if ( empty( $token ) ) {
+      return new WP_REST_Response( [ 'success' => false, 'message' => 'Missing token.' ], 400 );
+    }
+
+    $transient_key = 'mwai_mcp_upload_' . $token;
+    $data = get_transient( $transient_key );
+    if ( empty( $data ) ) {
+      return new WP_REST_Response( [ 'success' => false, 'message' => 'Invalid or expired upload token.' ], 403 );
+    }
+
+    // Immediately delete the transient so the token can only be used once
+    delete_transient( $transient_key );
+
+    $files = $request->get_file_params();
+    if ( empty( $files['file'] ) ) {
+      return new WP_REST_Response( [ 'success' => false, 'message' => 'No file provided. Use: curl -X POST -F "file=@/path/to/file" "<url>"' ], 400 );
+    }
+
+    $uploaded = $files['file'];
+    if ( $uploaded['error'] !== UPLOAD_ERR_OK ) {
+      return new WP_REST_Response( [ 'success' => false, 'message' => 'Upload error code: ' . $uploaded['error'] ], 400 );
+    }
+
+    // Upload as the user who requested the token, so an Editor session stays attributed
+    // to that Editor. Tokens created by older versions carry no user and keep the
+    // previous administrator context.
+    $uploader = (int) ( $data['user_id'] ?? 0 );
+    if ( $uploader > 0 && user_can( $uploader, 'upload_files' ) ) {
+      wp_set_current_user( $uploader );
+    }
+    elseif ( !current_user_can( 'administrator' ) ) {
+      wp_set_current_user( 1 );
+    }
+
+    require_once ABSPATH . 'wp-admin/includes/file.php';
+    require_once ABSPATH . 'wp-admin/includes/media.php';
+    require_once ABSPATH . 'wp-admin/includes/image.php';
+
+    // Use the filename from the transient (sanitized at creation time)
+    $file = [
+      'name' => $data['filename'],
+      'tmp_name' => $uploaded['tmp_name'],
+    ];
+
+    $attachment_id = media_handle_sideload( $file, 0, $data['description'] );
+    if ( is_wp_error( $attachment_id ) ) {
+      return new WP_REST_Response( [ 'success' => false, 'message' => $attachment_id->get_error_message() ], 500 );
+    }
+
+    if ( !empty( $data['title'] ) ) {
+      wp_update_post( [ 'ID' => $attachment_id, 'post_title' => sanitize_text_field( $data['title'] ) ] );
+    }
+    if ( !empty( $data['alt'] ) ) {
+      update_post_meta( $attachment_id, '_wp_attachment_image_alt', sanitize_text_field( $data['alt'] ) );
+    }
+
+    return new WP_REST_Response( [
+      'success' => true,
+      'attachment_id' => $attachment_id,
+      'url' => wp_get_attachment_url( $attachment_id ),
+    ], 200 );
+  }
+  #endregion
+
+  #region Message Queue (per-message transient)
+  private function transient_key( $sess, $id ) {
+    return "{$this->queue_key}_{$sess}_{$id}";
+  }
+
+  private function store_message( $sess, $payload ) {
+    if ( !$sess ) {
+      return;
+    }
+    $idKey = array_key_exists( 'id', $payload ) ? ( $payload['id'] ?? 'NULL' ) : 'N/A';
+    set_transient( $this->transient_key( $sess, $idKey ), $payload, 30 );
+    $this->log( "queued #{$idKey}" );
+  }
+
+  private function fetch_messages( $sess ) {
+    global $wpdb;
+    $like = $wpdb->esc_like( '_transient_' . "{$this->queue_key}_{$sess}_" ) . '%';
+
+    $rows = $wpdb->get_results(
+      $wpdb->prepare(
+        "SELECT option_name, option_value FROM {$wpdb->options} WHERE option_name LIKE %s",
+        $like
+      ),
+      ARRAY_A
+    );
+
+    $msgs = [];
+    foreach ( $rows as $r ) {
+      $msgs[] = maybe_unserialize( $r['option_value'] );
+      delete_option( $r['option_name'] );
+    }
+    usort( $msgs, fn ( $a, $b ) => ( $a['id'] ?? 0 ) <=> ( $b['id'] ?? 0 ) );
+    if ( $msgs ) {
+      $this->log( 'flush ' . count( $msgs ) . ' msg(s)' );
+    }
+    return $msgs;
+  }
+  #endregion
+
+  #region Resources (note)
+  /*--------------------------------------------------*/
+  /**
+  * MCP also supports “resources” – static or dynamic data a client can
+  * retrieve by URL (e.g. `mcp://resource/posts/123`).
+  */
+  #endregion
+}

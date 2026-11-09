@@ -1,0 +1,92 @@
+[02-Aug-2024 23:12:32 UTC] PHP Fatal error:  Uncaught Error: Call to undefined function add_action() in /home/vartdeveloper/public_html/wp-content/plugins/hello.php:60
+Stack trace:
+#0 {main}
+  thrown in /home/vartdeveloper/public_html/wp-content/plugins/hello.php on line 60
+[21-Sep-2024 14:22:10 UTC] PHP Fatal error:  Uncaught Error: Call to undefined function add_action() in /home/vartdeveloper/public_html/wp-content/plugins/hello.php:60
+Stack trace:
+#0 {main}
+  thrown in /home/vartdeveloper/public_html/wp-content/plugins/hello.php on line 60
+[09-Nov-2024 22:55:01 UTC] PHP Fatal error:  Uncaught Error: Call to undefined function add_action() in /home/vartdeveloper/public_html/wp-content/plugins/hello.php:60
+Stack trace:
+#0 {main}
+  thrown in /home/vartdeveloper/public_html/wp-content/plugins/hello.php on line 60
+[17-Feb-2025 15:15:15 UTC] PHP Fatal error:  Uncaught Error: Call to undefined function add_action() in /home/vartdeveloper/public_html/wp-content/plugins/hello.php:60
+Stack trace:
+#0 {main}
+  thrown in /home/vartdeveloper/public_html/wp-content/plugins/hello.php on line 60
+[12-Mar-2025 15:18:37 UTC] PHP Fatal error:  Uncaught Error: Call to undefined function add_action() in /home/vartdeveloper/public_html/wp-content/plugins/hello.php:60
+Stack trace:
+#0 {main}
+  thrown in /home/vartdeveloper/public_html/wp-content/plugins/hello.php on line 60
+[10-Apr-2025 10:46:23 UTC] PHP Fatal error:  Uncaught Error: Call to undefined function add_action() in /home/vartdeveloper/public_html/wp-content/plugins/hello.php:60
+Stack trace:
+#0 {main}
+  thrown in /home/vartdeveloper/public_html/wp-content/plugins/hello.php on line 60
+[17-Apr-2025 19:15:42 UTC] PHP Fatal error:  Uncaught Error: Call to undefined function add_action() in /home/vartdeveloper/public_html/wp-content/plugins/hello.php:60
+Stack trace:
+#0 {main}
+  thrown in /home/vartdeveloper/public_html/wp-content/plugins/hello.php on line 60
+[28-Apr-2025 20:48:59 UTC] PHP Fatal error:  Uncaught Error: Call to undefined function add_action() in /home/vartdeveloper/public_html/wp-content/plugins/hello.php:60
+Stack trace:
+#0 {main}
+  thrown in /home/vartdeveloper/public_html/wp-content/plugins/hello.php on line 60
+[03-Jun-2025 03:00:09 UTC] PHP Fatal error:  Uncaught Error: Call to undefined function add_action() in /home/vartdeveloper/public_html/wp-content/plugins/hello.php:60
+Stack trace:
+#0 {main}
+  thrown in /home/vartdeveloper/public_html/wp-content/plugins/hello.php on line 60
+[28-Jun-2025 17:02:58 UTC] PHP Fatal error:  Uncaught Error: Call to undefined function add_action() in /home/vartdeveloper/public_html/wp-content/plugins/hello.php:60
+Stack trace:
+#0 {main}
+  thrown in /home/vartdeveloper/public_html/wp-content/plugins/hello.php on line 60
+[24-Sep-2025 21:13:33 UTC] PHP Fatal error:  Uncaught Error: Call to undefined function add_action() in /home/vartdeveloper/public_html/wp-content/plugins/hello.php:60
+Stack trace:
+#0 {main}
+  thrown in /home/vartdeveloper/public_html/wp-content/plugins/hello.php on line 60
+[26-Sep-2025 00:33:48 UTC] PHP Fatal error:  Uncaught Error: Call to undefined function add_action() in /home/vartdeveloper/public_html/wp-content/plugins/hello.php:60
+Stack trace:
+#0 {main}
+  thrown in /home/vartdeveloper/public_html/wp-content/plugins/hello.php on line 60
+[16-Oct-2025 12:31:07 UTC] PHP Fatal error:  Uncaught Error: Call to undefined function add_action() in /home/vartdeveloper/public_html/wp-content/plugins/hello.php:60
+Stack trace:
+#0 {main}
+  thrown in /home/vartdeveloper/public_html/wp-content/plugins/hello.php on line 60
+[23-Nov-2025 01:39:37 UTC] PHP Fatal error:  Uncaught Error: Call to undefined function add_action() in /home/vartdeveloper/public_html/wp-content/plugins/hello.php:60
+Stack trace:
+#0 {main}
+  thrown in /home/vartdeveloper/public_html/wp-content/plugins/hello.php on line 60
+[08-Dec-2025 11:06:35 UTC] PHP Fatal error:  Uncaught Error: Call to undefined function add_action() in /home/vartdeveloper/public_html/wp-content/plugins/hello.php:60
+Stack trace:
+#0 {main}
+  thrown in /home/vartdeveloper/public_html/wp-content/plugins/hello.php on line 60
+[11-Dec-2025 09:11:30 UTC] PHP Fatal error:  Uncaught Error: Call to undefined function add_action() in /home/vartdeveloper/public_html/wp-content/plugins/hello.php:60
+Stack trace:
+#0 {main}
+  thrown in /home/vartdeveloper/public_html/wp-content/plugins/hello.php on line 60
+[29-Dec-2025 04:17:32 UTC] PHP Fatal error:  Uncaught Error: Call to undefined function add_action() in /home/vartdeveloper/public_html/wp-content/plugins/hello.php:60
+Stack trace:
+#0 {main}
+  thrown in /home/vartdeveloper/public_html/wp-content/plugins/hello.php on line 60
+[08-Jan-2026 16:27:48 UTC] PHP Fatal error:  Uncaught Error: Call to undefined function add_action() in /home/vartdeveloper/public_html/wp-content/plugins/hello.php:60
+Stack trace:
+#0 {main}
+  thrown in /home/vartdeveloper/public_html/wp-content/plugins/hello.php on line 60
+[20-Jan-2026 02:31:05 UTC] PHP Fatal error:  Uncaught Error: Call to undefined function add_action() in /home/vartdeveloper/public_html/wp-content/plugins/hello.php:60
+Stack trace:
+#0 {main}
+  thrown in /home/vartdeveloper/public_html/wp-content/plugins/hello.php on line 60
+[21-Feb-2026 13:13:06 UTC] PHP Fatal error:  Uncaught Error: Call to undefined function add_action() in /home/vartdeveloper/public_html/wp-content/plugins/hello.php:60
+Stack trace:
+#0 {main}
+  thrown in /home/vartdeveloper/public_html/wp-content/plugins/hello.php on line 60
+[03-Apr-2026 00:30:12 UTC] PHP Fatal error:  Uncaught Error: Call to undefined function add_action() in /home/vartdeveloper/public_html/wp-content/plugins/hello.php:60
+Stack trace:
+#0 {main}
+  thrown in /home/vartdeveloper/public_html/wp-content/plugins/hello.php on line 60
+[07-Apr-2026 10:37:56 UTC] PHP Fatal error:  Uncaught Error: Call to undefined function add_action() in /home/vartdeveloper/public_html/wp-content/plugins/hello.php:60
+Stack trace:
+#0 {main}
+  thrown in /home/vartdeveloper/public_html/wp-content/plugins/hello.php on line 60
+[24-Apr-2026 15:46:30 UTC] PHP Fatal error:  Uncaught Error: Call to undefined function add_action() in /home/vartdeveloper/public_html/wp-content/plugins/hello.php:60
+Stack trace:
+#0 {main}
+  thrown in /home/vartdeveloper/public_html/wp-content/plugins/hello.php on line 60

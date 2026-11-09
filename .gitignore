@@ -1,0 +1,70 @@
+# --- WordPress core (track theme/plugin custom work, not all of WP) ---
+# Keep core out of noisy diffs; Local already provides WP. Uncomment
+# the next block if you want a fully tracked WP tree instead.
+/wp-admin/
+/wp-includes/
+/wp-*.php
+/index.php
+/license.txt
+/readme.html
+/xmlrpc.php
+/local-xdebuginfo.php
+
+# --- Config & secrets ---
+wp-config.php
+wp-config-local.php
+.env
+.env.*
+*.pem
+*.key
+.htaccess
+.htpasswd
+
+# --- Dependencies / vendor ---
+node_modules/
+bower_components/
+vendor/
+composer.lock
+
+# --- Uploads & media (large / regenerated) ---
+wp-content/uploads/
+wp-content/upgrade/
+wp-content/upgrade-temp-backup/
+wp-content/cache/
+wp-content/backup*/
+wp-content/backups/
+wp-content/ai1wm-backups/
+wp-content/uploads-old/
+
+# --- Host / Local managed must-use plugins ---
+wp-content/mu-plugins/
+
+# --- Caches, logs, temp ---
+*.log
+custom-debug.log
+.cache/
+*.sql
+*.sql.gz
+*.wpress
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# --- Package / build artifacts ---
+*.zip
+*.tar
+*.tar.gz
+*.map
+dist/
+build/
+
+# --- Local / tooling ---
+.local/
+.phpunit.result.cache
+.php-cs-fixer.cache
