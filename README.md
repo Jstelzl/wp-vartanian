@@ -10,6 +10,7 @@ GoDaddy holds the original hosted install. **Local** runs an editable copy on th
 |---|---|
 | [Overview](docs/overview.md) | Goals, layout, safe workflow |
 | [Homepage](docs/homepage.md) | Local Home outline (SiteOrigin / menus) |
+| [Changelog](docs/changelog.md) | Dated log of Local redesign changes |
 | [GoDaddy](docs/godaddy.md) | Hosted original / production host |
 | [GitHub](docs/github.md) | Code backup and version history |
 | [Local](docs/local.md) | Desktop WordPress runtime |
